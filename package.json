@@ -1,0 +1,42 @@
+{
+  "name": "family-doudizhu",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "家人微信扫码参与的聚会斗地主",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n server,web \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "tsx watch --env-file-if-exists=.env apps/server/src/index.ts",
+    "dev:web": "vite --config apps/web/vite.config.ts --host 0.0.0.0",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "build": "npm run typecheck && vite build --config apps/web/vite.config.ts && node scripts/build-server.mjs",
+    "start": "node --env-file-if-exists=.env dist/server/index.js",
+    "voice:generate": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/generate-voice.ps1"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "qrcode": "^1.5.4",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "socket.io": "^4.8.4",
+    "socket.io-client": "^4.8.4"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.4",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "concurrently": "^10.0.5",
+    "esbuild": "^0.28.2",
+    "prettier": "^3.9.9",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.2"
+  }
+}
