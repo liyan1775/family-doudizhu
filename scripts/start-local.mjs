@@ -14,6 +14,7 @@ if (major < 22 || (major === 22 && minor < 12)) {
     console.log('聚会斗地主 · 正在为您打开游戏');
     const result = await launchLocal({
       directory,
+      mode: process.argv.includes('--public') ? 'public' : 'lan',
       ...(process.env.FAMILY_DDZ_NO_BROWSER === '1' ? { browser: async () => {} } : {}),
     });
     if (result.child) {
@@ -21,6 +22,7 @@ if (major < 22 || (major === 22 && minor < 12)) {
       const stop = async () => {
         if (stopping) return;
         stopping = true;
+        await stopChild(result.tunnel);
         await stopChild(result.child);
       };
       process.on('SIGINT', stop);
@@ -30,6 +32,7 @@ if (major < 22 || (major === 22 && minor < 12)) {
         else result.child.once('exit', done);
       });
       process.exitCode = stopping ? 0 : (code ?? 1);
+      await stopChild(result.tunnel);
     }
   } catch (error) {
     console.error(`\n${error.message}`);

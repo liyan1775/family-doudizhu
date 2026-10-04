@@ -4,7 +4,13 @@ const port = Number(process.env.PORT || 3000);
 if (!Number.isInteger(port) || port < 1 || port > 65535)
   throw new Error('PORT 必须是1到65535之间的整数');
 const host = process.env.HOST || '0.0.0.0';
-const server = makeServer({ publicBaseUrl: process.env.PUBLIC_BASE_URL });
+const temporaryPublic = process.env.FAMILY_DDZ_ENTRY_MODE === 'temporary';
+if (temporaryPublic && host !== '127.0.0.1') throw new Error('临时公网主机只能监听本机回环地址');
+const server = makeServer({
+  publicBaseUrl: process.env.PUBLIC_BASE_URL,
+  temporaryPublic,
+  ...(process.env.FAMILY_DDZ_BUILD_MODE === 'public' ? { staticPath: 'dist/public/client' } : {}),
+});
 server.http.once('error', (error: NodeJS.ErrnoException) => {
   process.exitCode = 1;
   const exit = () => {
@@ -22,7 +28,7 @@ server.http.once('error', (error: NodeJS.ErrnoException) => {
 });
 server.http.listen(port, host, () => {
   console.log(`聚会斗地主已启动：http://localhost:${port}`);
-  console.log('手机请连接同一 Wi-Fi，房间二维码使用电脑的局域网地址。');
+  if (!temporaryPublic) console.log('手机请连接同一 Wi-Fi，房间二维码使用电脑的局域网地址。');
   if (process.send) process.send({ type: 'ready', port });
 });
 let closing = false;
@@ -36,8 +42,22 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, shutdown
 // Only forked launcher children have IPC. Losing the launcher should not leave
 // an invisible server behind; an already-running manual server is untouched.
 if (process.send) {
-  process.on('message', (message: { type?: string } | null) => {
-    if (message?.type === 'shutdown') void shutdown();
-  });
+  process.on(
+    'message',
+    (message: { type?: string; requestId?: string; status?: unknown; url?: unknown } | null) => {
+      if (message?.type === 'shutdown') void shutdown();
+      if (message?.type === 'public-entry') {
+        try {
+          server.setPublicEntry({
+            status: message.status as 'connecting' | 'ready' | 'unavailable',
+            url: message.url as string | undefined,
+          });
+          process.send?.({ type: 'public-entry-updated', requestId: message.requestId });
+        } catch {
+          process.send?.({ type: 'public-entry-error', requestId: message.requestId });
+        }
+      }
+    },
+  );
   process.on('disconnect', shutdown);
 }

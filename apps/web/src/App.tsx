@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
-import { io, type Socket } from 'socket.io-client';
+import { type Socket } from 'socket.io-client';
 import QRCode from 'qrcode';
 import {
   analyze,
@@ -23,15 +23,13 @@ import { VoicePlayer, type VoiceStatus } from './voice.js';
 import { MusicPlayer, type MusicStatus } from './music.js';
 import { seatVoice, VOICES } from './audio-catalog.js';
 import { RoomDirectory } from './RoomDirectory.js';
-import { phoneEntryUrls } from './phone-links.js';
+import { isPublicEntry, phoneEntryUrls, type EntryConfig } from './phone-links.js';
 import { RoomFeedback, isActionTurn } from './room-feedback.js';
 import { TurnCue } from './turn-cue.js';
 import { handLayout } from './hand-layout.js';
+import { createGameConnection } from './connection.js';
 
-interface Config {
-  publicBaseUrl: string | null;
-  localUrls: string[];
-}
+type Config = EntryConfig;
 const SESSION_KEY = 'family-doudizhu-session';
 const SUIT_ICONS = { spades: '♠', hearts: '♥', clubs: '♣', diamonds: '♦', joker: '★' };
 function readSession(): Session | null {
@@ -267,7 +265,7 @@ export function App() {
       music.setActive(!document.hidden);
     };
     document.addEventListener('visibilitychange', visibility);
-    const s = io({ autoConnect: true, reconnection: true });
+    const s = createGameConnection();
     setSocket(s);
     s.on('connect', () => {
       setConnected(true);
@@ -346,16 +344,6 @@ export function App() {
       setRoom(state);
       setSelected((current) => current.filter((id) => state.hand.some((c) => c.id === id)));
     });
-    fetch('/api/config')
-      .then((r) => r.json())
-      .then((data: Config) => {
-        setConfig(data);
-        const phoneUrls = phoneEntryUrls(data);
-        const publicUrl = phoneEntryUrls({ publicBaseUrl: data.publicBaseUrl, localUrls: [] })[0];
-        const base = publicUrl || (localHost ? phoneUrls[0] || '' : location.origin);
-        setInviteBase(base);
-      })
-      .catch(() => setMessage('读取连接地址失败，稍后可刷新重试'));
     return () => {
       s.disconnect();
       document.removeEventListener('visibilitychange', visibility);
@@ -367,6 +355,56 @@ export function App() {
   }, [voice, music, cue, feedback]);
 
   useEffect(() => {
+    let active = true;
+    const controllers = new Set<AbortController>();
+    async function check() {
+      const controller = new AbortController();
+      controllers.add(controller);
+      const timer = window.setTimeout(() => controller.abort(), 5000);
+      try {
+        const response = await fetch('/api/config', {
+          signal: controller.signal,
+          cache: 'no-store',
+        });
+        if (!response.ok) throw new Error();
+        const data: Config = await response.json();
+        if (!Array.isArray(data.localUrls)) throw new Error();
+        if (!active) return;
+        setConfig(data);
+        const urls = phoneEntryUrls(data);
+        if (data.entryMode === 'temporary') setInviteBase(urls[0] || '');
+        else {
+          const base = data.publicBaseUrl
+            ? urls[0] || ''
+            : localHost
+              ? urls[0] || ''
+              : location.origin;
+          setInviteBase((current) => (urls.includes(current) ? current : base));
+        }
+      } catch {
+        if (active) setInviteBase('');
+      } finally {
+        clearTimeout(timer);
+        controllers.delete(controller);
+      }
+    }
+    void check();
+    const interval = window.setInterval(() => {
+      if (!document.hidden) void check();
+    }, 10_000);
+    const visibility = () => {
+      if (!document.hidden) void check();
+    };
+    document.addEventListener('visibilitychange', visibility);
+    return () => {
+      active = false;
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', visibility);
+      for (const controller of controllers) controller.abort();
+    };
+  }, [localHost]);
+
+  useEffect(() => {
     if (room) voice.prepare(Array.from({ length: MODES[room.mode].players }, (_, seat) => seat));
   }, [voice, room?.roomId, room?.mode]);
 
@@ -376,6 +414,7 @@ export function App() {
     return () => clearTimeout(timer);
   }, [message]);
   const joinUrl = room && inviteBase ? `${inviteBase}/?room=${room.roomId}` : '';
+  const publicMode = isPublicEntry(config);
   const qrTarget = phoneInvite ? inviteBase : joinUrl;
   useEffect(() => {
     let current = true;
@@ -804,9 +843,9 @@ export function App() {
               <div className="join-tip">
                 <span>⌁</span>
                 <p>
-                  手机和开桌的电脑
+                  {publicMode ? 'Wi-Fi 或手机流量' : '手机和开桌的电脑'}
                   <br />
-                  连接同一个 Wi-Fi
+                  {publicMode ? '扫码就能和家人一起玩' : '连接同一个 Wi-Fi'}
                 </p>
               </div>
               <button
@@ -1245,9 +1284,11 @@ export function App() {
           <p className="modal-description">
             {phoneInvite ? '房主用微信扫一扫，在手机上开桌，再邀请家人。' : '请家人用微信扫一扫，'}
             <br />
-            所有手机和电脑连接同一个 Wi-Fi。
+            {publicMode
+              ? 'Wi-Fi 或手机流量都能加入，无需安装软件。'
+              : '所有手机和电脑连接同一个 Wi-Fi。'}
           </p>
-          {qr ? (
+          {qr && qrTarget ? (
             <img
               className="qr-image"
               src={qr}
@@ -1255,8 +1296,25 @@ export function App() {
             />
           ) : (
             <div className="qr-placeholder">
-              {qrTarget ? '正在生成二维码…' : '没有找到局域网地址，请连接 Wi-Fi 后刷新'}
+              {qrTarget
+                ? '正在生成二维码…'
+                : publicMode
+                  ? '公网入口暂时中断，请等待电脑恢复联网；恢复后二维码会自动显示。'
+                  : '没有找到局域网地址，请连接 Wi-Fi 后刷新'}
             </div>
+          )}
+          {publicMode && qr && qrTarget && (
+            <a
+              className="button light full"
+              href={
+                config.entryMode === 'temporary'
+                  ? `/api/invite.png${phoneInvite ? '' : `?room=${room?.roomId}`}`
+                  : qr
+              }
+              download="聚会斗地主-房间邀请.png"
+            >
+              保存二维码，发给家人
+            </a>
           )}
           {!phoneInvite && room && (
             <>
@@ -1273,8 +1331,14 @@ export function App() {
           <details className="connection-help">
             <summary>扫码打不开？</summary>
             <p>
-              先确认手机和电脑在同一个 Wi-Fi。如果电脑有多个网络地址，可切换后重扫。Windows
-              防火墙需要允许此游戏的端口通信。
+              {publicMode ? (
+                '请使用本次启动的二维码，确认手机和主机电脑都能上网。微信提示打不开时，可在手机浏览器尝试。'
+              ) : (
+                <>
+                  先确认手机和电脑在同一个 Wi-Fi。如果电脑有多个网络地址，可切换后重扫。Windows
+                  防火墙需要允许此游戏的端口通信。
+                </>
+              )}
             </p>
             <select
               aria-label="二维码访问地址"
@@ -1282,7 +1346,7 @@ export function App() {
               onChange={(e) => setInviteBase(e.target.value)}
             >
               {phoneEntryUrls({
-                publicBaseUrl: config.publicBaseUrl,
+                ...config,
                 localUrls: [...config.localUrls, ...(localHost ? [] : [location.origin])],
               }).map((url) => (
                 <option key={url} value={url}>
@@ -1290,7 +1354,11 @@ export function App() {
                 </option>
               ))}
             </select>
-            <p>localhost 只能在这台电脑打开，手机请使用局域网地址。</p>
+            <p>
+              {publicMode
+                ? '本次邀请在启动窗口关闭后结束；电脑重新启动后请分享新二维码。'
+                : 'localhost 只能在这台电脑打开，手机请使用局域网地址。'}
+            </p>
           </details>
           <button
             className="button primary full"
@@ -1307,7 +1375,11 @@ export function App() {
         <Modal title="慢慢玩，很简单" onClose={() => setHelp(false)}>
           <ol className="help-steps">
             <li>房主填称呼，选择人数，再点创建房间。</li>
-            <li>家人连同一个 Wi-Fi，用微信扫码，填称呼加入。</li>
+            <li>
+              {publicMode
+                ? '家人用 Wi-Fi 或手机流量，微信扫码，填称呼加入。'
+                : '家人连同一个 Wi-Fi，用微信扫码，填称呼加入。'}
+            </li>
             <li>每人点准备。发牌后，轮流叫分或抢地主。</li>
             <li>轮到您时，点牌选中，再点出牌；不想跟牌就点不出。</li>
             <li>点提示可以帮您选牌。右上角“声音设置”可试听报牌、开关配乐。</li>

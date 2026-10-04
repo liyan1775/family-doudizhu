@@ -1,6 +1,8 @@
 export interface EntryConfig {
   publicBaseUrl: string | null;
   localUrls: string[];
+  entryMode?: 'lan' | 'fixed' | 'temporary';
+  publicStatus?: 'connecting' | 'ready' | 'unavailable';
 }
 
 function phoneUrl(value: string): string | null {
@@ -26,6 +28,11 @@ function phoneUrl(value: string): string | null {
 }
 
 export function phoneEntryUrls(config: EntryConfig): string[] {
+  if (config.entryMode === 'temporary') {
+    if (config.publicStatus !== 'ready' || !config.publicBaseUrl) return [];
+    const published = phoneUrl(config.publicBaseUrl);
+    return published?.startsWith('https://') ? [published] : [];
+  }
   const local = config.localUrls.map(phoneUrl).filter((url): url is string => !!url);
   const rank = (url: string) => {
     const host = new URL(url).hostname;
@@ -40,4 +47,13 @@ export function phoneEntryUrls(config: EntryConfig): string[] {
   local.sort((a, b) => rank(a) - rank(b));
   const published = config.publicBaseUrl ? phoneUrl(config.publicBaseUrl) : null;
   return [...new Set([...(published ? [published] : []), ...local])];
+}
+
+export function isPublicEntry(config: EntryConfig): boolean {
+  return (
+    config.entryMode === 'temporary' ||
+    // A developer can pin PUBLIC_BASE_URL to an HTTP Wi-Fi address as well.
+    // Keep its original same-network instructions.
+    !!(config.publicBaseUrl && phoneUrl(config.publicBaseUrl)?.startsWith('https://'))
+  );
 }

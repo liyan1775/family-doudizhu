@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import QRCode from 'qrcode';
-import { phoneEntryUrls, type EntryConfig } from './phone-links.js';
+import { isPublicEntry, phoneEntryUrls, type EntryConfig } from './phone-links.js';
 
 export function HostScreen() {
   const [urls, setUrls] = useState<string[]>([]);
@@ -10,6 +10,11 @@ export function HostScreen() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [attempt, setAttempt] = useState(0);
+  const [config, setConfig] = useState<EntryConfig>({ publicBaseUrl: null, localUrls: [] });
+  const [shareMessage, setShareMessage] = useState('');
+  const publicMode = isPublicEntry(config);
+  const entryReady =
+    connected && (config.entryMode !== 'temporary' || config.publicStatus === 'ready');
 
   useEffect(() => {
     let active = true;
@@ -29,6 +34,7 @@ export function HostScreen() {
         if (!Array.isArray(config.localUrls)) throw new Error();
         const options = phoneEntryUrls(config);
         if (!active) return;
+        setConfig(config);
         setUrls(options);
         setTarget((current) => (options.includes(current) ? current : (options[0] ?? '')));
         setConnected(true);
@@ -58,7 +64,8 @@ export function HostScreen() {
   useEffect(() => {
     let active = true;
     setQr('');
-    if (connected && target) {
+    setShareMessage('');
+    if (entryReady && target) {
       QRCode.toDataURL(target, {
         width: 440,
         margin: 4,
@@ -75,10 +82,10 @@ export function HostScreen() {
     return () => {
       active = false;
     };
-  }, [connected, target, attempt]);
+  }, [entryReady, target, attempt]);
 
   return (
-    <div className="app host-app">
+    <div className={`app host-app ${publicMode ? 'host-public' : ''}`}>
       <header className="topbar host-topbar">
         <div className="brand">
           <span className="brand-mark">♠</span>
@@ -86,9 +93,17 @@ export function HostScreen() {
             聚会斗地主<small>家人围一桌</small>
           </span>
         </div>
-        <span className={`connection host-status ${connected ? 'online' : ''}`} role="status">
+        <span className={`connection host-status ${entryReady ? 'online' : ''}`} role="status">
           <i />
-          {loading ? '正在准备' : connected ? '电脑主机已连接' : '主机未连接'}
+          {loading
+            ? '正在准备'
+            : !connected
+              ? '主机未连接'
+              : publicMode
+                ? entryReady
+                  ? '公网入口已连通'
+                  : '公网入口暂时中断'
+                : '电脑主机已连接'}
         </span>
       </header>
       <main className="host-main">
@@ -99,24 +114,55 @@ export function HostScreen() {
             <br className="host-mobile-break" />
             手机上开桌
           </h1>
-          <p>所有手机和这台电脑连接同一个 Wi-Fi。</p>
+          <p>
+            {publicMode
+              ? '不在一起也能玩。家人用 Wi-Fi 或手机流量，直接扫码加入。'
+              : '所有手机和这台电脑连接同一个 Wi-Fi。'}
+          </p>
         </section>
         <div className="host-content">
           <section className="host-qr-card" aria-label="手机进入游戏主页">
-            {qr && !error ? (
+            {qr && !error && entryReady ? (
               <img className="host-qr-image" src={qr} alt="游戏主页二维码" />
             ) : (
               <div className="host-qr-placeholder" role="status">
                 {error ||
                   (loading
                     ? '正在准备二维码…'
-                    : connected && !target
-                      ? '请先让电脑连接家里的 Wi-Fi，再点下面重新检查。'
-                      : '正在生成二维码…')}
+                    : config.entryMode === 'temporary' && !entryReady
+                      ? '公网入口暂时中断，请保持启动窗口打开并检查电脑联网。恢复后二维码会自动显示。'
+                      : connected && !target
+                        ? '请先让电脑连接家里的 Wi-Fi，再点下面重新检查。'
+                        : '正在生成二维码…')}
               </div>
             )}
             <h2>扫一扫，进入游戏主页</h2>
             <p>第一位家人和后来的人都可以扫这个码。</p>
+            {publicMode && qr && entryReady && !error && (
+              <div className="host-share">
+                <a
+                  className="button primary"
+                  href={config.entryMode === 'temporary' ? '/api/invite.png' : qr}
+                  download="聚会斗地主-本次邀请.png"
+                >
+                  保存二维码
+                </a>
+                <button
+                  className="button light"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(target);
+                      setShareMessage('邀请链接已复制，可以发给家人。');
+                    } catch {
+                      setShareMessage('暂时无法复制，请保存二维码分享给家人。');
+                    }
+                  }}
+                >
+                  复制邀请链接
+                </button>
+                <p role="status">{shareMessage || '保存二维码后，发给远方家人即可。'}</p>
+              </div>
+            )}
           </section>
           <section className="host-steps" aria-label="扫码后怎样入座">
             <div className="host-step">
@@ -142,11 +188,13 @@ export function HostScreen() {
               </div>
             </div>
             <div className="host-reminder">
-              <strong>电脑页面一直保留就好</strong>
+              <strong>{publicMode ? '本次邀请，关闭窗口后结束' : '电脑页面一直保留就好'}</strong>
               <p>
-                游玩时保持电脑开机、启动窗口打开。
+                游玩时保持电脑开机{publicMode ? '联网' : ''}、启动窗口打开。
                 <br />
-                打完后关闭启动窗口，结束本次游戏。
+                {publicMode
+                  ? '重新启动后，请分享新的二维码。'
+                  : '打完后关闭启动窗口，结束本次游戏。'}
               </p>
             </div>
           </section>
@@ -162,8 +210,14 @@ export function HostScreen() {
           <details className="connection-help host-connection-help">
             <summary>扫码打不开？</summary>
             <p>
-              先确认手机没有使用移动流量，和电脑连的是同一个
-              Wi-Fi。若仍打不开，可换一个网络地址再扫。
+              {publicMode ? (
+                '请确认电脑和手机都能上网，并使用本次启动的新二维码。若微信提示打不开，可先在手机浏览器尝试。'
+              ) : (
+                <>
+                  先确认手机没有使用移动流量，和电脑连的是同一个
+                  Wi-Fi。若仍打不开，可换一个网络地址再扫。
+                </>
+              )}
             </p>
             {urls.length > 1 && (
               <label>
@@ -185,7 +239,11 @@ export function HostScreen() {
                 </a>
               </p>
             )}
-            <p>家庭 Wi-Fi 不要使用访客网络；Windows 提示网络访问时，允许游戏在家庭网络使用。</p>
+            <p>
+              {publicMode
+                ? '临时入口需要电脑一直联网。入口恢复后会自动展示二维码；若联网组件已退出，请按启动窗口提示重新开桌。'
+                : '家庭 Wi-Fi 不要使用访客网络；Windows 提示网络访问时，允许游戏在家庭网络使用。'}
+            </p>
           </details>
         </div>
       </main>

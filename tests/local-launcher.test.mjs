@@ -36,9 +36,10 @@ async function freePort() {
   return port;
 }
 
-async function fixture(t, port, health) {
+async function fixture(t, port, health, mode = 'lan') {
   await mkdir(testRoot, { recursive: true });
   const directory = await mkdtemp(resolve(testRoot, 'case with space-'));
+  const buildRoot = mode === 'public' ? 'dist/public' : 'dist';
   const children = [];
   t.after(async () => {
     for (const child of children) await stopChild(child);
@@ -46,7 +47,7 @@ async function fixture(t, port, health) {
     assert.ok(resolve(directory).startsWith(testRoot + sep));
     await rm(directory, { recursive: true, force: true });
   });
-  for (const folder of ['dist/client', 'dist/server', 'apps/web/src', 'tmp']) {
+  for (const folder of [`${buildRoot}/client`, `${buildRoot}/server`, 'apps/web/src', 'tmp']) {
     await mkdir(resolve(directory, folder), { recursive: true });
   }
   for (const name of ['express', 'socket.io', 'vite', 'typescript', 'esbuild']) {
@@ -55,7 +56,7 @@ async function fixture(t, port, health) {
   }
   await writeFile(resolve(directory, '.env'), `PORT=${port}\nHOST=127.0.0.1\n`);
   await writeFile(resolve(directory, 'package.json'), '{"type":"module","version":"1.0.0"}');
-  await writeFile(resolve(directory, 'dist/client/index.html'), html);
+  await writeFile(resolve(directory, buildRoot, 'client/index.html'), html);
   await writeFile(resolve(directory, 'apps/web/src/example.ts'), 'before');
   const id = await projectId(directory);
   const identity = health ?? {
@@ -63,16 +64,19 @@ async function fixture(t, port, health) {
     service: 'family-doudizhu',
     projectId: id,
     version: '1.0.0',
+    ...(mode === 'public' ? { instanceId: 'this-instance', entryMode: 'temporary' } : {}),
   };
   const childSource = `
     import { createServer } from 'node:http';
     import { appendFileSync } from 'node:fs';
     const port = Number(process.env.PORT);
+    let publicStatus = 'connecting';
+    let publicBaseUrl = null;
     const server = createServer((req, res) => {
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify(req.url === '/api/config'
-        ? { publicBaseUrl: process.env.PUBLIC_BASE_URL || null, localUrls: ['http://192.168.0.2:' + port] }
-        : ${JSON.stringify(identity)}));
+        ? { publicBaseUrl: publicBaseUrl || process.env.PUBLIC_BASE_URL || null, localUrls: process.env.FAMILY_DDZ_ENTRY_MODE ? [] : ['http://192.168.0.2:' + port], publicStatus }
+        : { ...${JSON.stringify(identity)}, publicStatus, publicBaseUrl }));
     });
     server.once('error', (error) => process.send({ type: 'startup-error', code: error.code }, () => process.exit(1)));
     server.listen(port, process.env.HOST, () => {
@@ -81,18 +85,25 @@ async function fixture(t, port, health) {
     });
     let stopping = false;
     const stop = () => { if (stopping) return; stopping = true; server.close(() => process.exit(0)); };
-    process.on('message', (message) => { if (message?.type === 'shutdown') stop(); });
+    process.on('message', (message) => {
+      if (message?.type === 'shutdown') stop();
+      if (message?.type === 'public-entry') {
+        publicStatus = message.status; publicBaseUrl = message.url || null;
+        process.send({type:'public-entry-updated', requestId:message.requestId});
+      }
+    });
     process.on('disconnect', stop);
     process.on('SIGINT', stop);
     process.on('SIGTERM', stop);
   `;
-  await writeFile(resolve(directory, 'dist/server/index.js'), childSource);
-  await writeBuildInfo(directory);
+  await writeFile(resolve(directory, buildRoot, 'server/index.js'), childSource);
+  await writeBuildInfo(directory, buildRoot);
   const urls = [];
   const messages = [];
   const launch = async (extra = {}) => {
     const result = await launchLocal({
       directory,
+      mode,
       environment: {},
       browser: async (url) => urls.push(url),
       log: (line) => messages.push(line),
@@ -125,7 +136,10 @@ test('构建缓存检测源码变化、输出损坏和文件缺失，不依赖�
   assert.equal(await isBuildCurrent(f.directory), false);
   await writeBuildInfo(f.directory);
   await mkdir(resolve(f.directory, 'scripts'), { recursive: true });
-  await writeFile(resolve(f.directory, 'scripts/voice-lines.json'), JSON.stringify({ test: '新报牌' }));
+  await writeFile(
+    resolve(f.directory, 'scripts/voice-lines.json'),
+    JSON.stringify({ test: '新报牌' }),
+  );
   assert.equal(await isBuildCurrent(f.directory), false, '网页导入的声音文案也参与构建缓存校验');
   await writeBuildInfo(f.directory);
   await writeFile(resolve(f.directory, 'dist/client/index.html'), html + 'broken');
@@ -376,5 +390,94 @@ test(
       ),
     );
     assert.equal((await (await fetch(result.url + '/api/health')).json()).projectId, f.id);
+  },
+);
+
+test(
+  '公网连续双击只建立一个入口，独立端口和构建保留原局域网服务，重启生成新邀请',
+  { timeout: 15_000 },
+  async (t) => {
+    const port = await freePort();
+    const f = await fixture(t, port, undefined, 'public');
+    const lan = createServer((_req, res) =>
+      res.end(
+        JSON.stringify({ ok: true, service: 'family-doudizhu', projectId: f.id, version: '0.3.0' }),
+      ),
+    );
+    await new Promise((done, fail) => {
+      lan.once('error', fail);
+      lan.listen(port, '0.0.0.0', done);
+    });
+    t.after(() => close(lan));
+    await mkdir(resolve(f.directory, 'dist/client'), { recursive: true });
+    await writeFile(resolve(f.directory, 'dist/client/index.html'), 'original live LAN page');
+    await writeFile(
+      resolve(f.directory, '.env'),
+      `PORT=${port}\nHOST=0.0.0.0\nPUBLIC_BASE_URL=https://old.example\n`,
+    );
+    let starts = 0;
+    const factory = async ({ localUrl, instanceId, onStatus }) => {
+      starts++;
+      assert.ok(localUrl.startsWith('http://127.0.0.1:'));
+      assert.equal(instanceId, 'this-instance');
+      await new Promise((done) => setTimeout(done, 250));
+      const url = `https://family-${starts}.trycloudflare.com`;
+      await onStatus({ status: 'ready', url });
+      return { child: null, url };
+    };
+    const launches = await Promise.all([
+      f.launch({ tunnelFactory: factory }),
+      f.launch({ tunnelFactory: factory }),
+    ]);
+    assert.deepEqual(launches.map((r) => r.kind).sort(), ['reused', 'started']);
+    assert.equal(starts, 1);
+    assert.equal(launches[0].port, launches[1].port);
+    assert.ok(launches[0].port > port);
+    assert.equal(launches[0].publicBaseUrl, 'https://family-1.trycloudflare.com');
+    assert.equal(
+      await readFile(resolve(f.directory, 'dist/client/index.html'), 'utf8'),
+      'original live LAN page',
+    );
+    assert.equal(
+      (await (await fetch(`http://127.0.0.1:${port}/api/health`)).json()).version,
+      '0.3.0',
+    );
+    const settings = await (await fetch(launches[0].url + '/api/config')).json();
+    assert.deepEqual(settings.localUrls, []);
+    assert.equal(settings.publicBaseUrl, 'https://family-1.trycloudflare.com');
+    assert.ok(f.urls.every((url) => new URL(url).searchParams.get('host') === '1'));
+    await stopChild(launches.find((r) => r.child).child);
+    const again = await f.launch({ tunnelFactory: factory });
+    assert.equal(again.kind, 'started');
+    assert.equal(again.publicBaseUrl, 'https://family-2.trycloudflare.com');
+    assert.equal(starts, 2);
+  },
+);
+
+test(
+  '公网连接失败不展示二维码，清理新建服务，保留其他程序并允许再次启动',
+  { timeout: 15_000 },
+  async (t) => {
+    const port = await freePort();
+    const f = await fixture(t, port, undefined, 'public');
+    await assert.rejects(
+      f.launch({
+        tunnelFactory: async () => {
+          throw new Error('公网连接失败');
+        },
+      }),
+      /公网连接失败/,
+    );
+    assert.equal(f.urls.length, 0);
+    await assert.rejects(fetch(`http://127.0.0.1:${port}/api/health`));
+    const result = await f.launch({
+      tunnelFactory: async ({ onStatus }) => {
+        const url = 'https://retry-family.trycloudflare.com';
+        await onStatus({ status: 'ready', url });
+        return { child: null, url };
+      },
+    });
+    assert.equal(result.kind, 'started');
+    assert.equal(f.urls.length, 1);
   },
 );

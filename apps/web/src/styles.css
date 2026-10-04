@@ -211,6 +211,25 @@ small {
   font-size: 17px;
   color: var(--muted);
 }
+.host-public .host-qr-image {
+  max-width: clamp(220px, calc(100vh - 445px), 400px);
+}
+.host-share {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 16px;
+}
+.host-share .button {
+  font-size: 18px;
+  text-decoration: none;
+}
+.host-share p {
+  flex-basis: 100%;
+  font-size: 16px;
+  color: var(--muted);
+}
 .host-qr-placeholder {
   aspect-ratio: 1;
   display: grid;

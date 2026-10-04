@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { fork, spawn } from 'node:child_process';
 import { readFile, realpath, mkdir, writeFile, access } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -8,10 +8,12 @@ import { resolve } from 'node:path';
 import { parseEnv } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { isBuildCurrent } from './build-fingerprint.mjs';
+import { startTemporaryTunnel } from './temporary-tunnel.mjs';
+import { stopChild } from './managed-child.mjs';
+export { stopChild } from './managed-child.mjs';
 
 export const SERVICE = 'family-doudizhu';
 const GATE_SERVICE = 'family-doudizhu-launcher';
-const STATE_FILE = 'tmp/local-launcher.json';
 
 export async function projectId(directory) {
   const path = await realpath(directory);
@@ -21,7 +23,7 @@ export async function projectId(directory) {
     .slice(0, 24);
 }
 
-export async function readConfig(directory, environment = process.env) {
+export async function readConfig(directory, environment = process.env, mode = 'lan') {
   let fromFile = {};
   try {
     fromFile = parseEnv(await readFile(resolve(directory, '.env'), 'utf8'));
@@ -30,6 +32,16 @@ export async function readConfig(directory, environment = process.env) {
       throw new Error('无法读取游戏配置，请检查 .env 文件是否可以打开。');
   }
   const env = { ...fromFile, ...environment };
+  const temporaryPublic = mode === 'public';
+  if (temporaryPublic) {
+    env.HOST = '127.0.0.1';
+    env.PUBLIC_BASE_URL = '';
+    env.FAMILY_DDZ_ENTRY_MODE = 'temporary';
+    env.FAMILY_DDZ_BUILD_MODE = 'public';
+  } else {
+    env.FAMILY_DDZ_ENTRY_MODE = '';
+    env.FAMILY_DDZ_BUILD_MODE = '';
+  }
   const portText = env.PORT ?? '3000';
   if (!/^\d+$/.test(portText) || Number(portText) < 1 || Number(portText) > 65535) {
     throw new Error('启动没有成功：.env 中的 PORT 应填写1到65535之间的整数，例如 PORT=3000。');
@@ -48,6 +60,9 @@ export async function readConfig(directory, environment = process.env) {
     directory,
     id: await projectId(directory),
     env,
+    temporaryPublic,
+    buildRoot: temporaryPublic ? 'dist/public' : 'dist',
+    stateFile: temporaryPublic ? 'tmp/public-launcher.json' : 'tmp/local-launcher.json',
     host,
     port: Number(portText),
     base: (port) => `http://${authority}:${port}`,
@@ -94,11 +109,20 @@ export async function probeGame(config, port, allowLegacy = false) {
   const health = await readJsonUrl(`${url}/api/health`);
   if (!health?.ok) return null;
   if (health.service === SERVICE && health.projectId === config.id) {
-    return { port, url: config.page(port), version: health.version, legacy: false };
+    if (config.temporaryPublic !== (health.entryMode === 'temporary')) return null;
+    return {
+      port,
+      url: config.page(port),
+      version: health.version,
+      legacy: false,
+      instanceId: health.instanceId,
+      publicStatus: health.publicStatus,
+      publicBaseUrl: health.publicBaseUrl,
+    };
   }
   // The original release had no service identity. Only adopt its exact local
   // game page and configuration at the requested port; never terminate it.
-  if (allowLegacy && !health.service) {
+  if (allowLegacy && !config.temporaryPublic && !health.service) {
     let localHtml;
     try {
       localHtml = await readFile(resolve(config.directory, 'dist/client/index.html'), 'utf8');
@@ -121,7 +145,7 @@ function candidatePorts(port) {
 async function existingGame(config) {
   let saved;
   try {
-    saved = JSON.parse(await readFile(resolve(config.directory, STATE_FILE), 'utf8'));
+    saved = JSON.parse(await readFile(resolve(config.directory, config.stateFile), 'utf8'));
   } catch {}
   if (
     saved?.projectId === config.id &&
@@ -165,7 +189,7 @@ async function closeListener(server) {
 // stale PID or lock file cannot block the next double-click.
 async function acquireStartupGate(config, log) {
   const first = 40000 + (parseInt(config.id.slice(0, 8), 16) % 15000);
-  const deadline = Date.now() + 10 * 60_000;
+  const deadline = Date.now() + 20 * 60_000;
   let announced = false;
   for (let offset = 0; offset < 20; offset++) {
     const port = 40000 + ((first - 40000 + offset * 997) % 15000);
@@ -246,7 +270,7 @@ export function publicUrlForPort(value, preferred, selected) {
   );
 }
 
-async function npmCommand(directory, args) {
+async function npmCommand(directory, args, environment = {}) {
   await new Promise((done, fail) => {
     // Commands are fixed here; no user text is interpolated into shell code.
     const command = process.platform === 'win32' ? process.env.ComSpec || 'cmd.exe' : 'npm';
@@ -256,6 +280,7 @@ async function npmCommand(directory, args) {
       cwd: directory,
       stdio: 'inherit',
       windowsHide: true,
+      env: { ...process.env, ...environment },
     });
     child.once('error', fail);
     child.once('exit', (code) =>
@@ -264,7 +289,8 @@ async function npmCommand(directory, args) {
   });
 }
 
-async function prepareBuild(directory, log) {
+async function prepareBuild(config, log) {
+  const { directory } = config;
   const required = [
     'node_modules/express/package.json',
     'node_modules/socket.io/package.json',
@@ -292,33 +318,19 @@ async function prepareBuild(directory, log) {
       throw new Error('游戏组件没有准备完成。请确认电脑可以联网，再双击“启动游戏”。');
     }
   }
-  if (await isBuildCurrent(directory)) return;
+  if (await isBuildCurrent(directory, config.buildRoot)) return;
   log('正在准备最新的游戏内容，请稍候……');
   try {
-    await npmCommand(directory, ['run', 'build']);
+    await npmCommand(directory, ['run', 'build'], {
+      FAMILY_DDZ_BUILD_MODE: config.temporaryPublic ? 'public' : '',
+    });
   } catch {
     throw new Error('游戏内容没有构建成功。请保留上方提示，并交给项目维护者检查。');
   }
 }
 
-export async function stopChild(child) {
-  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
-  const stopped = new Promise((done) => child.once('exit', done));
-  if (child.connected) {
-    try {
-      child.send({ type: 'shutdown' }, () => {});
-    } catch {}
-  } else child.kill();
-  const timer = setTimeout(() => child.kill(), 3000);
-  try {
-    await stopped;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 async function startServer(config, port, publicBaseUrl) {
-  const child = fork(resolve(config.directory, 'dist/server/index.js'), [], {
+  const child = fork(resolve(config.directory, config.buildRoot, 'server/index.js'), [], {
     cwd: config.directory,
     execArgv: [],
     env: { ...process.env, ...config.env, PORT: String(port), PUBLIC_BASE_URL: publicBaseUrl },
@@ -385,13 +397,52 @@ export async function openBrowser(url) {
   });
 }
 
+async function updatePublicEntry(child, entry) {
+  const requestId = randomUUID();
+  await new Promise((done, fail) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.off('message', onMessage);
+      child.off('exit', onExit);
+    };
+    const onMessage = (message) => {
+      if (message?.requestId !== requestId) return;
+      cleanup();
+      if (message.type === 'public-entry-updated') done();
+      else fail(new Error('公网地址没有同步到游戏服务，未展示二维码。'));
+    };
+    const onExit = () => {
+      cleanup();
+      fail(new Error('游戏服务已退出'));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      fail(new Error('公网地址同步超时，未展示二维码。'));
+    }, 5000);
+    child.on('message', onMessage);
+    child.once('exit', onExit);
+    if (!child.connected) {
+      onExit();
+      return;
+    }
+    child.send({ type: 'public-entry', requestId, ...entry }, (error) => {
+      if (error) {
+        cleanup();
+        fail(error);
+      }
+    });
+  });
+}
+
 export async function launchLocal({
   directory,
   environment = process.env,
   log = console.log,
   browser = openBrowser,
+  mode = 'lan',
+  tunnelFactory = startTemporaryTunnel,
 }) {
-  const config = await readConfig(directory, environment);
+  const config = await readConfig(directory, environment, mode);
   const show = async (game, reused) => {
     const hostUrl = new URL('/?host=1', game.url).href;
     log(
@@ -406,6 +457,14 @@ export async function launchLocal({
       if (game.legacy || game.version !== version)
         log('原来的牌局会继续保留。新版本将在原游戏窗口关闭、再次启动后生效。');
     }
+    if (config.temporaryPublic) {
+      if (game.publicStatus === 'ready')
+        log(`本次公网邀请地址：${game.publicBaseUrl}，Wi-Fi 和手机流量均可扫码加入。`);
+      else
+        log(
+          '公网入口暂时中断，二维码已收起。请保持原启动窗口打开并检查电脑联网；若组件已退出，关闭原窗口后再双击重新开桌。',
+        );
+    }
     try {
       await browser(hostUrl);
     } catch {
@@ -413,12 +472,13 @@ export async function launchLocal({
     }
   };
   const running = await existingGame(config);
-  if (running) {
+  if (running && (!config.temporaryPublic || running.publicStatus !== 'connecting')) {
     await show(running, true);
     return { kind: 'reused', ...running };
   }
   const gate = await acquireStartupGate(config, log);
   let child;
+  let tunnel;
   try {
     const ready = await existingGame(config);
     if (ready) {
@@ -426,9 +486,13 @@ export async function launchLocal({
       return { kind: 'reused', ...ready };
     }
     // Preserve a healthy live game before touching any of its served files.
-    await prepareBuild(directory, log);
+    await prepareBuild(config, log);
     for (const port of candidatePorts(config.port)) {
-      if (!(await portAvailable(port, config.host))) continue;
+      // Windows permits a more-specific loopback listener beside a wildcard
+      // listener. Reserve the entire IPv4 port when selecting a public host so
+      // it cannot shadow an existing LAN game's localhost entry.
+      if (config.temporaryPublic && (await readUrl(`${config.base(port)}/api/health`))) continue;
+      if (!(await portAvailable(port, config.temporaryPublic ? '0.0.0.0' : config.host))) continue;
       const publicBaseUrl = publicUrlForPort(config.env.PUBLIC_BASE_URL, config.port, port);
       try {
         child = await startServer(config, port, publicBaseUrl);
@@ -437,9 +501,28 @@ export async function launchLocal({
         throw error;
       }
       const game = { port, url: config.page(port), child };
+      if (config.temporaryPublic) {
+        const identity = await probeGame(config, port);
+        tunnel = await tunnelFactory({
+          directory,
+          localUrl: config.base(port),
+          projectId: config.id,
+          instanceId: identity.instanceId,
+          log,
+          onStatus: (entry) => updatePublicEntry(child, entry),
+        });
+        Object.assign(game, {
+          tunnel: tunnel.child,
+          publicStatus: 'ready',
+          publicBaseUrl: tunnel.url,
+        });
+        child.once('exit', () => {
+          void stopChild(tunnel.child);
+        });
+      }
       await mkdir(resolve(directory, 'tmp'), { recursive: true });
       await writeFile(
-        resolve(directory, STATE_FILE),
+        resolve(directory, config.stateFile),
         JSON.stringify({
           projectId: config.id,
           host: config.host,
@@ -450,11 +533,16 @@ export async function launchLocal({
       if (port !== config.port)
         log(`常用端口${config.port}正在使用，已自动改用${port}。请使用当前页面生成的二维码。`);
       await show(game, false);
-      log('手机和电脑连接同一 Wi-Fi。请保持这个窗口打开；结束游戏时关闭窗口。');
+      log(
+        config.temporaryPublic
+          ? '请保持电脑开机联网、这个窗口打开；关闭窗口会结束本次房间，重新启动后请分享新二维码。'
+          : '手机和电脑连接同一 Wi-Fi。请保持这个窗口打开；结束游戏时关闭窗口。',
+      );
       return { kind: 'started', ...game };
     }
     throw new Error('附近的游戏端口都无法使用。请关闭以前的游戏启动窗口，或稍后再次双击。');
   } catch (error) {
+    if (tunnel) await stopChild(tunnel.child);
     if (child) await stopChild(child);
     throw error;
   } finally {

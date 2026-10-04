@@ -4,6 +4,8 @@ import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { networkInterfaces } from 'node:os';
 import { resolve } from 'node:path';
+import { isIP } from 'node:net';
+import QRCode from 'qrcode';
 import { Server, type Socket } from 'socket.io';
 import packageInfo from '../../../package.json' with { type: 'json' };
 import {
@@ -50,6 +52,12 @@ export interface ServerOptions {
   publicBaseUrl?: string;
   staticPath?: string;
   projectDirectory?: string;
+  temporaryPublic?: boolean;
+}
+
+export interface PublicEntry {
+  status: 'connecting' | 'ready' | 'unavailable';
+  url?: string;
 }
 
 export function makeServer(options: ServerOptions = {}) {
@@ -60,21 +68,40 @@ export function makeServer(options: ServerOptions = {}) {
   const rooms = new Map<string, Room>();
   const bindings = new WeakMap<Socket, Binding>();
   const requestCounts = new Map<string, { count: number; resetAt: number }>();
+  const instanceId = randomUUID();
+  let publicEntry: PublicEntry = { status: 'connecting' };
+  const entryMode = options.temporaryPublic ? 'temporary' : options.publicBaseUrl ? 'fixed' : 'lan';
 
   const projectPath = realpathSync(options.projectDirectory ?? process.cwd());
   const projectId = createHash('sha256')
     .update(process.platform === 'win32' ? projectPath.toLowerCase() : projectPath)
     .digest('hex')
     .slice(0, 24);
-  app.get('/api/health', (_req, res) =>
+  app.get('/api/health', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
     res.json({
       ok: true,
       service: 'family-doudizhu',
       projectId,
       version: packageInfo.version,
-    }),
-  );
+      instanceId,
+      entryMode,
+      ...(options.temporaryPublic
+        ? { publicStatus: publicEntry.status, publicBaseUrl: publicEntry.url ?? null }
+        : {}),
+    });
+  });
   app.get('/api/config', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    if (options.temporaryPublic) {
+      res.json({
+        entryMode,
+        publicStatus: publicEntry.status,
+        publicBaseUrl: publicEntry.status === 'ready' ? publicEntry.url : null,
+        localUrls: [],
+      });
+      return;
+    }
     const address = http.address();
     const port = address && typeof address !== 'string' ? address.port : 3000;
     const localUrls = [
@@ -89,7 +116,37 @@ export function makeServer(options: ServerOptions = {}) {
         ),
       ),
     ];
-    res.json({ publicBaseUrl: options.publicBaseUrl?.replace(/\/$/, '') || null, localUrls });
+    res.json({
+      entryMode,
+      publicBaseUrl: options.publicBaseUrl?.replace(/\/$/, '') || null,
+      localUrls,
+    });
+  });
+  app.get('/api/invite.png', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    if (!options.temporaryPublic || publicEntry.status !== 'ready' || !publicEntry.url) {
+      res.status(503).send('公网入口尚未连通，请等待二维码重新显示');
+      return;
+    }
+    const roomId = req.query.room;
+    if (
+      roomId !== undefined &&
+      (typeof roomId !== 'string' || !/^\d{6}$/.test(roomId) || !rooms.has(roomId))
+    ) {
+      res.status(404).send('这桌已结束，请使用本次新二维码');
+      return;
+    }
+    const target = `${publicEntry.url}${roomId ? `/?room=${roomId}` : ''}`;
+    const png = await QRCode.toBuffer(target, {
+      type: 'png',
+      width: 440,
+      margin: 4,
+      errorCorrectionLevel: 'M',
+      color: { dark: '#163e31', light: '#ffffff' },
+    });
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Content-Disposition', 'attachment; filename="family-doudizhu-invite.png"');
+    res.send(png);
   });
   app.use((_req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -117,13 +174,14 @@ export function makeServer(options: ServerOptions = {}) {
     res.json({ rooms: available });
   });
   const staticPath = options.staticPath ?? resolve('dist/client');
-  for (const version of ['classic-v1', 'classic-v2']) app.use(
-    `/audio/${version}`,
-    express.static(resolve(staticPath, `audio/${version}`), {
-      maxAge: '30d',
-      immutable: true,
-    }),
-  );
+  for (const version of ['classic-v1', 'classic-v2'])
+    app.use(
+      `/audio/${version}`,
+      express.static(resolve(staticPath, `audio/${version}`), {
+        maxAge: '30d',
+        immutable: true,
+      }),
+    );
   app.use(express.static(staticPath));
   app.get('/', (_req, res) =>
     res.sendFile(resolve(options.staticPath ?? 'dist/client', 'index.html')),
@@ -220,7 +278,16 @@ export function makeServer(options: ServerOptions = {}) {
         if (typeof ack !== 'function') return;
         const respond = ack as (reply: Ack<unknown>) => void;
         try {
-          const ip = socket.handshake.address;
+          // Only the loopback-only temporary host trusts Cloudflare's visitor
+          // address. Do not trust arbitrary forwarded headers on a LAN host.
+          const forwarded = socket.handshake.headers['cf-connecting-ip'];
+          const loopback = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(
+            socket.handshake.address,
+          );
+          const ip =
+            options.temporaryPublic && loopback && typeof forwarded === 'string' && isIP(forwarded)
+              ? forwarded
+              : socket.handshake.address;
           const now = Date.now();
           let counter = requestCounts.get(ip);
           if (!counter || counter.resetAt < now) {
@@ -367,6 +434,19 @@ export function makeServer(options: ServerOptions = {}) {
     app,
     http,
     io,
+    setPublicEntry: (entry: PublicEntry) => {
+      if (!options.temporaryPublic) throw new Error('当前主机没有启用临时公网入口');
+      if (!['connecting', 'ready', 'unavailable'].includes(entry.status))
+        throw new Error('公网入口状态不正确');
+      if (entry.status === 'ready') {
+        if (
+          typeof entry.url !== 'string' ||
+          !/^https:\/\/[a-z0-9]+(?:-[a-z0-9]+)*\.trycloudflare\.com$/.test(entry.url)
+        )
+          throw new Error('临时公网地址不正确');
+        publicEntry = { status: 'ready', url: entry.url };
+      } else publicEntry = { status: entry.status };
+    },
     close: async () => {
       clearInterval(expiry);
       await new Promise<void>((done) => io.close(() => done()));

@@ -56,33 +56,38 @@ export async function sourceHash(directory) {
   ]);
 }
 
-async function outputHash(directory) {
+async function outputHash(directory, buildRoot) {
   return hashFiles(
     directory,
     (
-      await Promise.all(['dist/client', 'dist/server'].map((path) => filesUnder(directory, path)))
+      await Promise.all(
+        [`${buildRoot}/client`, `${buildRoot}/server`].map((path) => filesUnder(directory, path)),
+      )
     ).flat(),
   );
 }
 
-export async function writeBuildInfo(directory) {
+export async function writeBuildInfo(directory, buildRoot = 'dist') {
   const info = {
     schema: 1,
     source: await sourceHash(directory),
-    output: await outputHash(directory),
+    output: await outputHash(directory, buildRoot),
   };
-  await writeFile(resolve(directory, 'dist/build-info.json'), JSON.stringify(info));
+  await writeFile(resolve(directory, buildRoot, 'build-info.json'), JSON.stringify(info));
 }
 
-export async function isBuildCurrent(directory) {
+export async function isBuildCurrent(directory, buildRoot = 'dist') {
   try {
-    const info = JSON.parse(await readFile(resolve(directory, 'dist/build-info.json'), 'utf8'));
+    const info = JSON.parse(
+      await readFile(resolve(directory, buildRoot, 'build-info.json'), 'utf8'),
+    );
     if (info.schema !== 1) return false;
-    for (const file of ['dist/client/index.html', 'dist/server/index.js']) {
+    for (const file of [`${buildRoot}/client/index.html`, `${buildRoot}/server/index.js`]) {
       if (!(await stat(resolve(directory, file))).isFile()) return false;
     }
     return (
-      info.source === (await sourceHash(directory)) && info.output === (await outputHash(directory))
+      info.source === (await sourceHash(directory)) &&
+      info.output === (await outputHash(directory, buildRoot))
     );
   } catch (error) {
     if (error.code === 'ENOENT' || error instanceof SyntaxError) return false;

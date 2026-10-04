@@ -6,7 +6,10 @@ export default defineConfig({
   root: fileURLToPath(new URL('.', import.meta.url)),
   plugins: [react()],
   build: {
-    outDir: '../../dist/client',
+    outDir:
+      process.env.FAMILY_DDZ_BUILD_MODE === 'public'
+        ? '../../dist/public/client'
+        : '../../dist/client',
     emptyOutDir: true,
     target: ['es2020', 'chrome80', 'safari14'],
   },
