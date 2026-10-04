@@ -1,0 +1,12 @@
+{
+  "provider": "Microsoft Edge online neural voices",
+  "toolVersion": "edge-tts==7.2.8",
+  "generatedOn": "2026-10-03",
+  "voices": [
+    { "id": "lively-male", "voice": "zh-CN-YunxiNeural", "rate": "+5%", "pitch": "+0Hz" },
+    { "id": "warm-female", "voice": "zh-CN-XiaoxiaoNeural", "rate": "+4%", "pitch": "+0Hz" },
+    { "id": "deep-male", "voice": "zh-CN-YunjianNeural", "rate": "+2%", "pitch": "+0Hz" },
+    { "id": "bright-female", "voice": "zh-CN-XiaoyiNeural", "rate": "+6%", "pitch": "+0Hz" }
+  ],
+  "sampleText": "对三！大王！三带二！炸弹！王炸！不要。"
+}

@@ -68,6 +68,58 @@ test('全员不叫会重新发牌并轮换首叫玩家，离线会暂停动作',
   game.players[2].online = false;
   assert.throws(() => bid(game, 'p1', 3), /暂时离线/);
 });
+
+test('叫三分和最后叫分均先保留该次报分，再宣布地主，操作者身份各自正确', () => {
+  for (const values of [[3], [1, 0, 2], [1, 2, 0]]) {
+    const game = prepared('three-classic');
+    let lastActor = '';
+    let beforeId = 0;
+    for (const value of values) {
+      lastActor = game.turnId!;
+      beforeId = game.event.id;
+      bid(game, lastActor, value);
+    }
+    const last = values.at(-1)!;
+    const key = last ? `bid-${last}` : 'no-bid';
+    assert.equal(game.phase, 'playing');
+    assert.equal(game.event.id, beforeId + 1);
+    assert.deepEqual(game.event.audio, [key, 'landlord']);
+    assert.equal(game.event.announcements?.[0].actorId, lastActor);
+    assert.equal(game.event.announcements?.[0].kind, 'bid');
+    assert.equal(game.event.announcements?.[1].actorId, game.landlordId);
+    assert.equal(game.event.announcements?.[1].kind, 'landlord');
+  }
+});
+
+test('全员不叫的最后一句在重新发牌之前，二人拒抢和第四次抢地主也不会漏播', () => {
+  for (const profile of ['three-classic', 'four-classic', 'two-rob'] as RuleProfile[]) {
+    const game = prepared(profile);
+    let actor = '';
+    for (const p of game.players) {
+      actor = game.turnId!;
+      if (profile === 'two-rob') rob(game, actor, false);
+      else bid(game, actor, 0);
+    }
+    assert.equal(game.round, 2);
+    assert.deepEqual(game.event.audio, ['no-bid', 'redeal']);
+    assert.equal(game.event.announcements?.[0].actorId, actor);
+    assert.deepEqual(
+      game.event.announcements?.map((part) => part.kind),
+      ['bid', 'deal'],
+    );
+  }
+  const refuse = prepared('two-rob');
+  rob(refuse, 'p0', true);
+  rob(refuse, 'p1', false);
+  assert.deepEqual(refuse.event.audio, ['no-rob', 'landlord']);
+  assert.deepEqual(
+    refuse.event.announcements?.map((part) => part.actorId),
+    ['p1', 'p0'],
+  );
+  const four = prepared('two-rob');
+  for (let i = 0; i < 4; i++) rob(four, four.turnId!, true);
+  assert.deepEqual(four.event.audio, ['rob-landlord', 'landlord']);
+});
 test('二人抢地主最多4次，农民按让牌数获胜', () => {
   const game = prepared('two-rob');
   for (let i = 0; i < 4; i++) rob(game, game.turnId!, true);

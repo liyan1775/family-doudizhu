@@ -1,9 +1,11 @@
 import express from 'express';
 import { createServer } from 'node:http';
-import { randomBytes, randomInt, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { networkInterfaces } from 'node:os';
 import { resolve } from 'node:path';
 import { Server, type Socket } from 'socket.io';
+import packageInfo from '../../../package.json' with { type: 'json' };
 import {
   addPlayer,
   announce,
@@ -23,6 +25,7 @@ import type {
   Ack,
   GameMode,
   GameState,
+  RoomSummary,
   RoomView,
   RuleProfile,
   Session,
@@ -46,6 +49,7 @@ interface Binding {
 export interface ServerOptions {
   publicBaseUrl?: string;
   staticPath?: string;
+  projectDirectory?: string;
 }
 
 export function makeServer(options: ServerOptions = {}) {
@@ -57,7 +61,19 @@ export function makeServer(options: ServerOptions = {}) {
   const bindings = new WeakMap<Socket, Binding>();
   const requestCounts = new Map<string, { count: number; resetAt: number }>();
 
-  app.get('/api/health', (_req, res) => res.json({ ok: true }));
+  const projectPath = realpathSync(options.projectDirectory ?? process.cwd());
+  const projectId = createHash('sha256')
+    .update(process.platform === 'win32' ? projectPath.toLowerCase() : projectPath)
+    .digest('hex')
+    .slice(0, 24);
+  app.get('/api/health', (_req, res) =>
+    res.json({
+      ok: true,
+      service: 'family-doudizhu',
+      projectId,
+      version: packageInfo.version,
+    }),
+  );
   app.get('/api/config', (_req, res) => {
     const address = http.address();
     const port = address && typeof address !== 'string' ? address.port : 3000;
@@ -80,7 +96,35 @@ export function makeServer(options: ServerOptions = {}) {
     res.setHeader('Referrer-Policy', 'same-origin');
     next();
   });
-  app.use(express.static(options.staticPath ?? resolve('dist/client')));
+  app.get('/api/rooms', (_req, res) => {
+    const available: RoomSummary[] = [...rooms.values()]
+      .filter(
+        ({ game }) =>
+          game.phase === 'waiting' &&
+          game.players.length < MODES[game.mode].players &&
+          game.players.some((player) => player.online),
+      )
+      .sort((a, b) => b.touchedAt - a.touchedAt)
+      .map(({ id, hostId, game }) => ({
+        roomId: id,
+        hostName: game.players.find((player) => player.id === hostId)?.name ?? '家人',
+        mode: game.mode,
+        profile: game.profile,
+        playerCount: game.players.length,
+        maxPlayers: MODES[game.mode].players,
+      }));
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ rooms: available });
+  });
+  const staticPath = options.staticPath ?? resolve('dist/client');
+  for (const version of ['classic-v1', 'classic-v2']) app.use(
+    `/audio/${version}`,
+    express.static(resolve(staticPath, `audio/${version}`), {
+      maxAge: '30d',
+      immutable: true,
+    }),
+  );
+  app.use(express.static(staticPath));
   app.get('/', (_req, res) =>
     res.sendFile(resolve(options.staticPath ?? 'dist/client', 'index.html')),
   );

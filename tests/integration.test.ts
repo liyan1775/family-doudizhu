@@ -4,6 +4,7 @@ import { io, type Socket } from 'socket.io-client';
 import { makeServer } from '../apps/server/src/server.js';
 import { MODES, PROFILES, suggestPlay } from '../packages/game/src/index.js';
 import type { Ack, RoomView, RuleProfile, Session } from '../packages/game/src/index.js';
+import { eventClips, eventVoice, seatVoice } from '../apps/web/src/audio-catalog.js';
 
 interface Peer {
   socket: Socket;
@@ -108,6 +109,18 @@ test('真实联机：五种玩法均可入座、准备、打完、结算和下�
       } else assert.ok((await request(first, 'bid', { value: 3 })).ok);
       await Promise.all(peers.map((p) => waitState(p, (state) => state.phase === 'playing')));
       const landlord = peers.find((p) => p.state!.landlordId === p.state!.youId)!;
+      for (const p of peers) {
+        const view = p.state!;
+        assert.deepEqual(view.event.audio, [
+          profile === 'two-rob' ? 'no-rob' : 'bid-3',
+          'landlord',
+        ]);
+        assert.equal(view.event.announcements?.[1].actorId, view.landlordId);
+        assert.equal(
+          eventClips(view.event, view.players, view.youId)[1].key,
+          p === landlord ? 'own-landlord' : 'own-farmer',
+        );
+      }
       if (mode === 'four')
         assert.ok(peers.filter((p) => p !== landlord).every((p) => p.state!.bottom.length === 0));
       for (const p of peers) {
@@ -136,6 +149,13 @@ test('真实联机：五种玩法均可入座、准备、打完、结算和下�
         await Promise.all(
           peers.map((p) => waitState(p, (state) => state.event.id > view.event.id)),
         );
+        const actorSeat = view.players.find((p) => p.id === view.youId)!.seat;
+        if (peers[0].state!.phase === 'playing') {
+          for (const p of peers) {
+            assert.equal(p.state!.event.actorId, view.youId);
+            assert.equal(eventVoice(p.state!.event, p.state!.players), seatVoice(actorSeat).id);
+          }
+        }
       }
       assert.equal(peers[0].state!.phase, 'finished');
       assert.equal(
@@ -165,6 +185,7 @@ test('联机身份：满员拒绝加入，离线保留手牌，正确令牌可�
     await Promise.all([a, b].map((p) => waitState(p, (state) => state.players.length === 2)));
     await readyPeers([a, b]);
     const hand = a.state!.hand.map((c) => c.id);
+    const voiceBefore = seatVoice(a.state!.players.find((p) => p.id === session.playerId)!.seat).id;
     a.socket.disconnect();
     await waitState(b, (state) => state.players.some((p) => !p.online));
     assert.equal(
@@ -181,6 +202,10 @@ test('联机身份：满员拒绝加入，离线保留手牌，正确令牌可�
     assert.deepEqual(
       state.hand.map((c) => c.id),
       hand,
+    );
+    assert.equal(
+      seatVoice(state.players.find((p) => p.id === session.playerId)!.seat).id,
+      voiceBefore,
     );
     await waitState(b, (state) => state.players.every((p) => p.online));
     assert.equal((await request(b, 'bid', { value: 3 })).ok, false);

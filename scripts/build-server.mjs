@@ -1,4 +1,5 @@
 import { build } from 'esbuild';
+import { writeBuildInfo } from './build-fingerprint.mjs';
 
 await build({
   entryPoints: ['apps/server/src/index.ts'],
@@ -10,3 +11,5 @@ await build({
   target: 'node22',
   sourcemap: true,
 });
+
+await writeBuildInfo(process.cwd());

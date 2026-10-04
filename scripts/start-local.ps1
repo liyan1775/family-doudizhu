@@ -1,13 +1,22 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $projectDirectory = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $projectDirectory
-if (-not (Get-Command node -ErrorAction SilentlyContinue)) { throw 'Please install Node.js 24 LTS first.' }
-if (-not (Test-Path -LiteralPath 'node_modules')) {
-  & npm.cmd ci
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = $OutputEncoding
+try {
+  if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+    Write-Host '请先安装 Node.js 24 LTS，然后重新双击“启动游戏”。' -ForegroundColor Yellow
+    exit 1
+  }
+  $taskNodeVersion = (& node -p 'process.versions.node').Split('.')
+  if ([int]$taskNodeVersion[0] -lt 22 -or ([int]$taskNodeVersion[0] -eq 22 -and [int]$taskNodeVersion[1] -lt 12)) {
+    Write-Host 'Node.js 版本过旧，请安装 Node.js 24 LTS 后重新双击“启动游戏”。' -ForegroundColor Yellow
+    exit 1
+  }
+  & node (Join-Path $PSScriptRoot 'start-local.mjs')
+  exit $LASTEXITCODE
+} catch {
+  Write-Host '游戏没有启动成功。请保留下面的提示，交给项目维护者检查：' -ForegroundColor Yellow
+  Write-Host $_.Exception.Message
+  exit 1
 }
-# Always build the current source to avoid accidentally starting an older version.
-& npm.cmd run build
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-& npm.cmd start
-exit $LASTEXITCODE

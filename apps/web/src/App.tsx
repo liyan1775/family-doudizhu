@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { io, type Socket } from 'socket.io-client';
 import QRCode from 'qrcode';
 import {
@@ -20,6 +20,13 @@ import type {
   Session,
 } from '../../../packages/game/src/index.js';
 import { VoicePlayer, type VoiceStatus } from './voice.js';
+import { MusicPlayer, type MusicStatus } from './music.js';
+import { seatVoice, VOICES } from './audio-catalog.js';
+import { RoomDirectory } from './RoomDirectory.js';
+import { phoneEntryUrls } from './phone-links.js';
+import { RoomFeedback, isActionTurn } from './room-feedback.js';
+import { TurnCue } from './turn-cue.js';
+import { handLayout } from './hand-layout.js';
 
 interface Config {
   publicBaseUrl: string | null;
@@ -54,7 +61,7 @@ function PlayingCard({
       {selected && <span className="card-check">✓</span>}
     </>
   );
-  const className = `playing-card ${red ? 'red' : ''} ${small ? 'small' : ''} ${selected ? 'selected' : ''} ${card.rank > 15 ? 'joker' : ''}`;
+  const className = `playing-card ${red ? 'red' : ''} ${small ? 'small' : ''} ${selected ? 'selected' : ''} ${card.rank > 15 ? 'joker' : ''} ${card.rank === 10 ? 'ten' : ''}`;
   return onClick ? (
     <button
       type="button"
@@ -62,13 +69,101 @@ function PlayingCard({
       onClick={onClick}
       aria-label={label}
       aria-pressed={selected}
+      data-card-id={card.id}
     >
       {content}
     </button>
   ) : (
-    <span className={className} aria-label={label}>
+    <span className={className} aria-label={label} data-card-id={card.id}>
       {content}
     </span>
+  );
+}
+function HandCards({
+  cards,
+  selected,
+  onSelect,
+  compact,
+  scrollRef,
+}: {
+  cards: Card[];
+  selected: string[];
+  onSelect?: (id: string) => void;
+  compact: boolean;
+  scrollRef: RefObject<HTMLDivElement | null>;
+}) {
+  const [size, setSize] = useState({ width: 280, height: 180 });
+  useLayoutEffect(() => {
+    const element = scrollRef.current;
+    if (!element || !compact) return;
+    const measure = () => {
+      const style = getComputedStyle(element);
+      const next = {
+        width: element.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
+        height:
+          element.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom),
+      };
+      setSize((current) =>
+        Math.abs(current.width - next.width) < 0.5 && Math.abs(current.height - next.height) < 0.5
+          ? current
+          : next,
+      );
+    };
+    measure();
+    const observer =
+      typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(measure);
+    observer?.observe(element);
+    window.addEventListener('resize', measure);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', measure);
+    };
+  }, [compact, scrollRef]);
+  const layout = handLayout(cards.length, size.width, size.height);
+  const renderCard = (card: Card) => (
+    <PlayingCard
+      key={card.id}
+      card={card}
+      selected={selected.includes(card.id)}
+      onClick={onSelect ? () => onSelect(card.id) : undefined}
+    />
+  );
+  let offset = 0;
+  return (
+    <div
+      className="hand-cards"
+      ref={scrollRef}
+      style={
+        compact
+          ? ({
+              '--hand-card-width': `${layout.cardWidth}px`,
+              '--hand-card-height': `${layout.cardHeight}px`,
+              '--hand-font-size': `${layout.fontSize}px`,
+            } as React.CSSProperties)
+          : undefined
+      }
+    >
+      {compact
+        ? layout.columns.map((count, row) => {
+            const rowCards = cards.slice(offset, offset + count);
+            offset += count;
+            return (
+              <div
+                className="hand-card-row"
+                key={row}
+                style={{
+                  gridTemplateColumns:
+                    count > 1
+                      ? `repeat(${count - 1}, minmax(0, 1fr)) var(--hand-card-width)`
+                      : 'var(--hand-card-width)',
+                }}
+              >
+                {rowCards.map(renderCard)}
+              </div>
+            );
+          })
+        : cards.map(renderCard)}
+    </div>
   );
 }
 function Modal({
@@ -114,24 +209,64 @@ export function App() {
   const [invite, setInvite] = useState(false);
   const [phoneInvite, setPhoneInvite] = useState(false);
   const [help, setHelp] = useState(false);
+  const [soundSettings, setSoundSettings] = useState(false);
+  const [soundCategory, setSoundCategory] = useState<'voice' | 'music'>('voice');
   const [leave, setLeave] = useState(false);
+  const [tableInfo, setTableInfo] = useState(false);
+  const [landlordReveal, setLandlordReveal] = useState<string | null>(null);
+  const [cueError, setCueError] = useState(false);
   const [config, setConfig] = useState<Config>({ publicBaseUrl: null, localUrls: [] });
   const [inviteBase, setInviteBase] = useState('');
   const [qr, setQr] = useState('');
   const localHost = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
   const [voice] = useState(() => new VoicePlayer());
-  const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>({
-    enabled: voice.enabled,
-    unlocked: false,
-    error: false,
-  });
-  const seenEvent = useRef<number | null>(null);
-  const previousTurn = useRef<string | null>(null);
+  const [cue] = useState(() => new TurnCue());
+  const [feedback] = useState(() => new RoomFeedback());
+  const [music] = useState(() => new MusicPlayer());
+  const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>(voice.status);
+  const [musicStatus, setMusicStatus] = useState<MusicStatus>(music.status);
+  const revealTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const revealActive = useRef(false);
+  const handScroll = useRef<HTMLDivElement>(null);
   const latestRoom = useRef<RoomView | null>(null);
   latestRoom.current = room;
+  function cancelReveal() {
+    clearTimeout(revealTimer.current);
+    revealActive.current = false;
+    setLandlordReveal(null);
+  }
+  function unlockVoice() {
+    cue.unlock();
+    voice.unlock();
+  }
 
   useEffect(() => {
-    voice.onStatus = setVoiceStatus;
+    voice.onStatus = (status) => {
+      setVoiceStatus(status);
+      if (!status.enabled) cue.clear();
+    };
+    music.onStatus = setMusicStatus;
+    let speechActive = false;
+    let cueActive = false;
+    voice.onSpeaking = (speaking) => {
+      speechActive = speaking;
+      music.duck(speechActive || cueActive);
+    };
+    cue.onPlaying = (playing) => {
+      cueActive = playing;
+      music.duck(speechActive || cueActive);
+    };
+    cue.onError = setCueError;
+    voice.prepareSamples();
+    const visibility = () => {
+      voice.clear();
+      cue.clear();
+      feedback.suspend();
+      cancelReveal();
+      if (!document.hidden && latestRoom.current) feedback.observe(latestRoom.current);
+      music.setActive(!document.hidden);
+    };
+    document.addEventListener('visibilitychange', visibility);
     const s = io({ autoConnect: true, reconnection: true });
     setSocket(s);
     s.on('connect', () => {
@@ -150,7 +285,7 @@ export function App() {
             if (!result.ok) {
               if (readSession()?.token === session.token) localStorage.removeItem(SESSION_KEY);
               setRoom(null);
-              seenEvent.current = null;
+              feedback.suspend();
               if (new URLSearchParams(location.search).get('room') === session.roomId) {
                 history.replaceState(null, '', '/');
                 setRoomNumber('');
@@ -160,28 +295,54 @@ export function App() {
           },
         );
     });
-    s.on('disconnect', () => setConnected(false));
+    s.on('disconnect', () => {
+      setConnected(false);
+      voice.clear();
+      cue.clear();
+      feedback.suspend();
+      cancelReveal();
+    });
     s.on('connect_error', () => setConnected(false));
     s.on('session-replaced', () => {
       // 同一站点的页面共享身份；保留令牌，另一页面刷新后仍能恢复座位。
       setReplaced(true);
+      voice.clear();
+      cue.clear();
+      feedback.suspend();
+      cancelReveal();
       setRoom(null);
       setInvite(false);
-      seenEvent.current = null;
     });
     s.on('room-state', (state: RoomView) => {
-      const firstState = seenEvent.current === null || latestRoom.current?.roomId !== state.roomId;
-      if (!firstState && seenEvent.current !== state.event.id) {
-        voice.play(state.event.audio);
-        if (
-          state.turnId === state.youId &&
-          previousTurn.current !== state.turnId &&
-          state.players.every((p) => p.online)
-        )
-          voice.play(['your-turn']);
+      const signal = feedback.observe(state, !document.hidden);
+      if (!isActionTurn(state)) cue.clear();
+      if (state.phase !== 'playing') cancelReveal();
+      if (signal.announce) voice.playEvent(state.event, state.players, state.youId);
+      if (signal.reveal) {
+        const landlordName = state.players.find((p) => p.id === state.landlordId)?.name ?? '家人';
+        clearTimeout(revealTimer.current);
+        revealActive.current = true;
+        setLandlordReveal(`${landlordName}当地主`);
+        const { roomId, round, landlordId } = state;
+        revealTimer.current = setTimeout(() => {
+          revealActive.current = false;
+          setLandlordReveal(null);
+          const current = latestRoom.current;
+          if (
+            !document.hidden &&
+            s.connected &&
+            current &&
+            current.roomId === roomId &&
+            current.round === round &&
+            current.landlordId === landlordId &&
+            isActionTurn(current)
+          )
+            cue.play(voice.enabled && voice.unlocked);
+        }, 1400);
+      } else if (signal.cue && !revealActive.current) {
+        cue.play(voice.enabled && voice.unlocked);
       }
-      seenEvent.current = state.event.id;
-      previousTurn.current = state.turnId;
+      latestRoom.current = state;
       setRoom(state);
       setSelected((current) => current.filter((id) => state.hand.some((c) => c.id === id)));
     });
@@ -189,18 +350,25 @@ export function App() {
       .then((r) => r.json())
       .then((data: Config) => {
         setConfig(data);
-        const sorted = [...data.localUrls].sort(
-          (a, b) => Number(!a.includes('192.168.')) - Number(!b.includes('192.168.')),
-        );
-        const base = data.publicBaseUrl || (localHost ? sorted[0] || '' : location.origin);
+        const phoneUrls = phoneEntryUrls(data);
+        const publicUrl = phoneEntryUrls({ publicBaseUrl: data.publicBaseUrl, localUrls: [] })[0];
+        const base = publicUrl || (localHost ? phoneUrls[0] || '' : location.origin);
         setInviteBase(base);
       })
       .catch(() => setMessage('读取连接地址失败，稍后可刷新重试'));
     return () => {
       s.disconnect();
+      document.removeEventListener('visibilitychange', visibility);
       voice.dispose();
+      cue.dispose();
+      clearTimeout(revealTimer.current);
+      music.dispose();
     };
-  }, [voice]);
+  }, [voice, music, cue, feedback]);
+
+  useEffect(() => {
+    if (room) voice.prepare(Array.from({ length: MODES[room.mode].players }, (_, seat) => seat));
+  }, [voice, room?.roomId, room?.mode]);
 
   useEffect(() => {
     if (!message) return;
@@ -246,16 +414,22 @@ export function App() {
   }
   async function act(event: string, payload: object = {}) {
     if (busy) return;
+    if (voice.enabled && !voice.unlocked) unlockVoice();
+    else if (voice.enabled && !cue.unlocked) cue.unlock();
     setBusy(true);
     setMessage('');
     try {
       await request(event, payload);
       if (event === 'play' || event === 'pass') setSelected([]);
       if (event === 'leave-room') {
+        voice.clear();
+        cue.clear();
+        feedback.suspend();
+        cancelReveal();
+        music.setActive(false);
         localStorage.removeItem(SESSION_KEY);
         setRoom(null);
         setLeave(false);
-        seenEvent.current = null;
         setSelected([]);
         history.replaceState(null, '', '/');
         setRoomNumber('');
@@ -266,17 +440,20 @@ export function App() {
       setBusy(false);
     }
   }
-  async function enter(create: boolean) {
+  async function enter(create: boolean, joinRoomNumber = roomNumber) {
     if (!name.trim()) {
       setMessage('先填写您的称呼，方便家人认出您');
       document.getElementById('player-name')?.focus();
       return;
     }
-    if (!create && !/^\d{6}$/.test(roomNumber)) {
+    if (!create && !/^\d{6}$/.test(joinRoomNumber)) {
       setMessage('请填写6位房间号');
       return;
     }
-    if (voice.enabled && !voice.unlocked) voice.unlock();
+    if (voice.enabled && !voice.unlocked) unlockVoice();
+    else if (voice.enabled) cue.unlock();
+    music.setActive(true);
+    if (music.enabled) music.start();
     setBusy(true);
     setMessage('');
     try {
@@ -284,7 +461,7 @@ export function App() {
         name,
         mode,
         profile,
-        roomId: roomNumber,
+        roomId: joinRoomNumber,
       });
       if (session) {
         setPhoneInvite(false);
@@ -314,7 +491,11 @@ export function App() {
       limit.limit === null || limit.used < limit.limit,
     );
     setSelected(ids);
-    document.getElementById('your-hand')?.scrollIntoView({ behavior: 'auto', block: 'center' });
+    requestAnimationFrame(() =>
+      handScroll.current
+        ?.querySelector('.selected')
+        ?.scrollIntoView({ behavior: 'auto', block: 'nearest' }),
+    );
     setMessage(ids.length ? '已经帮您选好；看一眼，再点出牌' : '没有能压过的牌，可以点“不出”');
   }
   const selectedCards = useMemo(
@@ -327,21 +508,48 @@ export function App() {
     !!room &&
     beats(selectedCombo, room.lastPlay?.combo ?? null, room.mode, room.profile);
   const me = room?.players.find((p) => p.id === room.youId);
-  const myTurn = room?.turnId === room?.youId;
+  const inGame = !!room && !['waiting', 'finished'].includes(room.phase);
+  const myTurn = !!room && room.turnId === room.youId;
   const allOnline = room?.players.every((p) => p.online) ?? true;
-  const canAct = connected && !busy && allOnline;
+  const canAct = connected && !busy && allOnline && !landlordReveal;
   const turnName = room?.players.find((p) => p.id === room.turnId)?.name;
+  const landlordName = room?.players.find((p) => p.id === room.landlordId)?.name;
+  const actionWord =
+    room?.phase === 'playing'
+      ? '出牌'
+      : room?.phase === 'bidding'
+        ? '叫分'
+        : room?.phase === 'calling'
+          ? '叫地主'
+          : '抢地主';
+  const turnText = !connected
+    ? '正在连接，请稍等'
+    : !allOnline
+      ? '有家人离线，等回来继续'
+      : landlordReveal
+        ? '地主确定'
+        : room?.phase === 'finished'
+          ? room.event.text
+          : myTurn
+            ? `请${actionWord}`
+            : `等${turnName ?? '家人'}${actionWord}`;
   const voiceLabel =
     voiceStatus.unlocked && voiceStatus.enabled
-      ? '声音已开'
+      ? '报牌已开'
       : voiceStatus.enabled
-        ? '开启声音'
-        : '声音已关';
+        ? '报牌待开启'
+        : '报牌已关';
   const toggleVoice = () =>
-    voiceStatus.enabled && voiceStatus.unlocked ? voice.mute() : voice.unlock();
+    voiceStatus.enabled && voiceStatus.unlocked ? voice.mute() : unlockVoice();
+  const soundLoading = voiceStatus.loading;
+  const loadPercent = soundLoading.total
+    ? Math.round((soundLoading.loaded / soundLoading.total) * 100)
+    : 0;
 
   return (
-    <div className={room ? 'app in-room' : 'app'}>
+    <div
+      className={`app ${room ? 'in-room' : ''} ${inGame ? 'game-active' : ''} ${inGame && myTurn && connected && allOnline && !landlordReveal ? 'my-turn' : ''}`}
+    >
       <header className="topbar">
         <a
           className="brand"
@@ -365,17 +573,65 @@ export function App() {
             <i />
             {connected ? '已连接' : '连接中'}
           </span>
-          <button className="sound-button" onClick={toggleVoice}>
+          <button
+            className="sound-button"
+            onClick={() => {
+              if (inGame && voiceStatus.enabled && !voiceStatus.unlocked) unlockVoice();
+              setSoundSettings(true);
+            }}
+            aria-label={`声音设置，${voiceLabel}`}
+          >
             <span>{voiceStatus.unlocked && voiceStatus.enabled ? '♪' : '♫'}</span>
-            {voiceLabel}
+            {inGame && voiceStatus.enabled && !voiceStatus.unlocked ? '恢复声音' : '声音设置'}
           </button>
-          <button className="help-button" onClick={() => setHelp(true)} aria-label="玩法说明">
-            ?
-          </button>
+          {inGame ? (
+            <button className="table-info-button" onClick={() => setTableInfo(true)}>
+              牌桌
+            </button>
+          ) : (
+            <button className="help-button" onClick={() => setHelp(true)} aria-label="玩法说明">
+              ?
+            </button>
+          )}
         </div>
       </header>
       {voiceStatus.error && (
-        <div className="notice">声音暂时没有播放，请点右上角“开启声音”重新试听。</div>
+        <div className="notice" role="status">
+          {inGame ? '报牌声音待恢复。' : '报牌暂时没有播放，仍可看文字继续玩。'}
+          <button className="text-link" onClick={unlockVoice}>
+            {inGame ? '恢复声音' : '恢复报牌声音'}
+          </button>
+        </div>
+      )}
+      {cueError && voiceStatus.enabled && (
+        <div className="notice" role="status">
+          回合提示音暂时没有播放。
+          <button className="text-link" onClick={() => cue.unlock()}>
+            恢复提示音
+          </button>
+        </div>
+      )}
+      {musicStatus.error && (
+        <div className="notice" role="status">
+          配乐暂时没有播放。
+          <button className="text-link" onClick={() => music.start()}>
+            恢复配乐
+          </button>
+          <button className="text-link" onClick={() => music.stop()}>
+            关闭配乐
+          </button>
+        </div>
+      )}
+      {voiceStatus.enabled && soundLoading.phase === 'loading' && (
+        <div className="sound-loading" role="status">
+          <span>正在准备报牌声音 · {loadPercent}%</span>
+          <progress
+            value={soundLoading.loaded}
+            max={soundLoading.total}
+            aria-label="报牌声音加载进度"
+          />
+          <small>可以先入座，准备好就能听到。</small>
+        </div>
       )}
       {replaced && (
         <div className="notice">
@@ -461,6 +717,24 @@ export function App() {
               autoComplete="nickname"
             />
             <span className="field-hint">不用注册，填个熟悉的称呼就好。</span>
+          </div>
+          {!initialRoom && (
+            <RoomDirectory
+              disabled={!connected || busy}
+              onJoin={(table) => {
+                setRoomNumber(table.roomId);
+                void enter(false, table.roomId);
+              }}
+            />
+          )}
+          <div className="sound-welcome">
+            <div>
+              <strong>熟悉的报牌，热闹的牌桌</strong>
+              <p>男女声音按座位区分，配乐可以单独开启。</p>
+            </div>
+            <button className="button light" onClick={() => setSoundSettings(true)}>
+              试听声音 ♪
+            </button>
           </div>
           <div className={`entry-grid ${initialRoom ? 'invited' : ''}`}>
             <section className="entry-card create-entry">
@@ -553,7 +827,7 @@ export function App() {
           </footer>
         </main>
       ) : (
-        <main className="room-page">
+        <main className={`room-page ${room.allowance > 0 ? 'with-allowance' : ''}`}>
           <div className="room-heading">
             <div>
               <span className="eyebrow">
@@ -575,33 +849,59 @@ export function App() {
           </div>
           <section
             className="players"
-            style={{ '--players': MODES[room.mode].players } as React.CSSProperties}
+            aria-label="玩家余牌数量"
+            style={
+              { '--players': MODES[room.mode].players - (inGame ? 1 : 0) } as React.CSSProperties
+            }
           >
             {Array.from({ length: MODES[room.mode].players }, (_, seat) => {
               const p = room.players.find((p) => p.seat === seat);
               return (
                 <div
                   key={seat}
-                  className={`player-seat ${p?.id === room.turnId ? 'current' : ''} ${!p ? 'empty' : ''} ${p && !p.online ? 'offline-seat' : ''}`}
+                  className={`player-seat ${p?.id === room.youId ? 'own-seat' : ''} ${p?.id === room.turnId ? 'current' : ''} ${!p ? 'empty' : ''} ${p && !p.online ? 'offline-seat' : ''}`}
                 >
                   <div className="avatar">{p ? [...p.name][0] : '+'}</div>
                   <strong>
                     {p ? `${p.name}${p.id === room.youId ? '（您）' : ''}` : '等家人'}
                   </strong>
-                  <span>
-                    {!p
-                      ? '扫码入座'
-                      : !p.online
-                        ? '暂时离线'
-                        : room.phase === 'waiting'
-                          ? p.ready
-                            ? '✓ 已准备'
-                            : '尚未准备'
-                          : `${p.id === room.landlordId ? '地主' : room.landlordId ? '农民' : '待叫地主'} · ${p.cardCount}张`}
-                  </span>
-                  <small>{p ? `积分 ${p.score >= 0 ? '+' : ''}${p.score}` : '空座位'}</small>
+                  {inGame && p ? (
+                    <>
+                      <span className="remaining-count">
+                        <b>{p.cardCount}</b> 张
+                        <small className="seat-role">
+                          {!p.online
+                            ? '离线'
+                            : room.landlordId
+                              ? p.id === room.landlordId
+                                ? '地主'
+                                : '农民'
+                              : p.id === room.turnId
+                                ? room.phase === 'bidding'
+                                  ? '叫分'
+                                  : '叫抢'
+                                : '待定'}
+                        </small>
+                      </span>
+                    </>
+                  ) : (
+                    <span>
+                      {!p
+                        ? '扫码入座'
+                        : !p.online
+                          ? '暂时离线'
+                          : room.phase === 'waiting'
+                            ? p.ready
+                              ? '✓ 已准备'
+                              : '尚未准备'
+                            : `${p.id === room.landlordId ? '地主' : room.landlordId ? '农民' : '待叫地主'} · ${p.cardCount}张`}
+                    </span>
+                  )}
+                  <small className="seat-score">
+                    {p ? `积分 ${p.score >= 0 ? '+' : ''}${p.score}` : '空座位'}
+                  </small>
                   {p && room.bombLimits[p.id].limit !== null && (
-                    <small>
+                    <small className="seat-bombs">
                       炸弹 {room.bombLimits[p.id].used}/{room.bombLimits[p.id].limit}
                     </small>
                   )}
@@ -631,14 +931,18 @@ export function App() {
             </section>
           ) : (
             <>
-              <section className="table">
+              <section
+                className={`table ${landlordReveal ? 'revealing' : ''} ${room.allowance > 0 ? 'has-allowance' : ''}`}
+              >
                 <div className="table-top">
-                  <span>
-                    {room.phase === 'bidding'
-                      ? '叫分确定地主'
-                      : room.phase === 'calling' || room.phase === 'robbing'
-                        ? '抢地主 · 让牌'
-                        : '家人的牌桌'}
+                  <span className="landlord-label">
+                    {room.landlordId
+                      ? `地主：${landlordName}`
+                      : room.phase === 'bidding'
+                        ? '叫分确定地主'
+                        : room.phase === 'calling' || room.phase === 'robbing'
+                          ? '抢地主 · 让牌'
+                          : '家人的牌桌'}
                   </span>
                   <span>
                     {room.profile === 'two-rob' ? '基础' : '叫分'} ×{room.highestBid || 1} · 倍数 ×
@@ -646,22 +950,28 @@ export function App() {
                   </span>
                 </div>
                 <div className="turn-banner" aria-live="polite">
-                  {!allOnline
-                    ? '有家人暂时离线，等回来后继续'
-                    : room.phase === 'finished'
-                      ? room.event.text
-                      : myTurn
-                        ? room.phase === 'playing'
-                          ? '轮到您出牌'
-                          : '轮到您叫地主'
-                        : `等${turnName ?? '家人'}${room.phase === 'playing' ? '出牌' : '叫地主'}`}
+                  {turnText}
                 </div>
+                {landlordReveal && (
+                  <div className="landlord-reveal" role="status">
+                    <strong>{landlordReveal}</strong>
+                    <span>
+                      {room.landlordId === room.youId
+                        ? '您是地主，您先出牌'
+                        : '您是农民，等地主先出牌'}
+                    </span>
+                  </div>
+                )}
                 <div className="last-play">
                   {room.lastPlay ? (
                     <>
                       <p>
-                        {room.players.find((p) => p.id === room.lastPlay?.playerId)?.name} ·{' '}
-                        {describeCombo(room.lastPlay.combo)}
+                        <span className="last-play-name">
+                          {room.players.find((p) => p.id === room.lastPlay?.playerId)?.name}
+                        </span>
+                        <span className="last-play-description">
+                          {describeCombo(room.lastPlay.combo)} · {room.lastPlay.cards.length}张
+                        </span>
                       </p>
                       <div className="played-cards">
                         {room.lastPlay.cards.map((card) => (
@@ -744,25 +1054,22 @@ export function App() {
                         : '身份待定'}
                   </span>
                 </div>
-                <div className="hand-cards">
-                  {room.hand.map((card) => (
-                    <PlayingCard
-                      key={card.id}
-                      card={card}
-                      selected={selected.includes(card.id)}
-                      onClick={
-                        room.phase === 'playing' && myTurn && canAct
-                          ? () =>
-                              setSelected((current) =>
-                                current.includes(card.id)
-                                  ? current.filter((id) => id !== card.id)
-                                  : [...current, card.id],
-                              )
-                          : undefined
-                      }
-                    />
-                  ))}
-                </div>
+                <HandCards
+                  cards={room.hand}
+                  selected={selected}
+                  compact={inGame}
+                  scrollRef={handScroll}
+                  onSelect={
+                    room.phase === 'playing' && myTurn && canAct
+                      ? (id) =>
+                          setSelected((current) =>
+                            current.includes(id)
+                              ? current.filter((selectedId) => selectedId !== id)
+                              : [...current, id],
+                          )
+                      : undefined
+                  }
+                />
                 <p className="selection-hint">
                   {room.phase === 'playing'
                     ? selected.length
@@ -774,14 +1081,19 @@ export function App() {
                       ? '剩余手牌'
                       : '看看手牌，再决定要不要当地主'}
                 </p>
-                {voiceStatus.enabled && !voiceStatus.unlocked && (
-                  <button className="voice-recover" onClick={() => voice.unlock()}>
+                {!inGame && voiceStatus.enabled && !voiceStatus.unlocked && !voiceStatus.error && (
+                  <button className="voice-recover" onClick={unlockVoice}>
                     点一下，恢复报牌声音 ♪
                   </button>
                 )}
               </section>
               {room.phase !== 'finished' && (
-                <div className="action-dock">
+                <div
+                  className={`action-dock ${room.phase === 'calling' || room.phase === 'robbing' ? 'rob-actions' : ''}`}
+                >
+                  <div className="action-turn" role="status">
+                    {turnText}
+                  </div>
                   {room.phase === 'bidding' ? (
                     <>
                       <button
@@ -856,6 +1168,72 @@ export function App() {
           </footer>
         </main>
       )}
+      {tableInfo && room && (
+        <Modal title="这桌的情况" onClose={() => setTableInfo(false)}>
+          <p className="modal-hint">
+            房间 {room.roomId} · {PROFILES[room.profile].name}
+          </p>
+          <div className="score-list">
+            {room.players.map((p) => (
+              <div key={p.id}>
+                <strong>
+                  {p.name}
+                  {p.id === room.youId ? '（您）' : ''}
+                </strong>
+                <span>
+                  {p.id === room.landlordId ? '地主' : room.landlordId ? '农民' : '身份待定'} · 积分{' '}
+                  {p.score >= 0 ? '+' : ''}
+                  {p.score}
+                </span>
+                {room.bombLimits[p.id].limit !== null && (
+                  <span>
+                    炸弹 {room.bombLimits[p.id].used}/{room.bombLimits[p.id].limit}
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+          {room.bottom.length > 0 && (
+            <details className="bottom-cards">
+              <summary>{room.mode === 'four' ? '您的8张底牌' : '本局3张底牌'}</summary>
+              <div>
+                {room.bottom.map((c) => (
+                  <PlayingCard key={c.id} card={c} small />
+                ))}
+              </div>
+            </details>
+          )}
+          <div className="table-info-actions">
+            <button
+              className="button light"
+              onClick={() => {
+                setTableInfo(false);
+                setInvite(true);
+              }}
+            >
+              邀请家人
+            </button>
+            <button
+              className="button light"
+              onClick={() => {
+                setTableInfo(false);
+                setHelp(true);
+              }}
+            >
+              玩法说明
+            </button>
+            <button
+              className="button light"
+              onClick={() => {
+                setTableInfo(false);
+                setLeave(true);
+              }}
+            >
+              离开牌桌
+            </button>
+          </div>
+        </Modal>
+      )}
       {invite && (room || phoneInvite) && (
         <Modal
           title={phoneInvite ? '用手机扫码开桌' : '扫一扫，一起入座'}
@@ -903,13 +1281,10 @@ export function App() {
               value={inviteBase}
               onChange={(e) => setInviteBase(e.target.value)}
             >
-              {[
-                ...new Set(
-                  [config.publicBaseUrl, location.origin, ...config.localUrls].filter(
-                    (x): x is string => !!x,
-                  ),
-                ),
-              ].map((url) => (
+              {phoneEntryUrls({
+                publicBaseUrl: config.publicBaseUrl,
+                localUrls: [...config.localUrls, ...(localHost ? [] : [location.origin])],
+              }).map((url) => (
                 <option key={url} value={url}>
                   {url}
                 </option>
@@ -935,7 +1310,7 @@ export function App() {
             <li>家人连同一个 Wi-Fi，用微信扫码，填称呼加入。</li>
             <li>每人点准备。发牌后，轮流叫分或抢地主。</li>
             <li>轮到您时，点牌选中，再点出牌；不想跟牌就点不出。</li>
-            <li>点提示可以帮您选牌。右上角可开启或关闭报牌声音。</li>
+            <li>点提示可以帮您选牌。右上角“声音设置”可试听报牌、开关配乐。</li>
           </ol>
           <p className="help-note">
             二人、四人有地方变体，房主可在开桌前选择玩法。本桌规则：
@@ -943,6 +1318,104 @@ export function App() {
           </p>
           <button className="button primary full" onClick={() => setHelp(false)}>
             明白了
+          </button>
+        </Modal>
+      )}
+      {soundSettings && (
+        <Modal title="声音设置" onClose={() => setSoundSettings(false)}>
+          <div className="sound-categories" role="group" aria-label="声音类别">
+            <button
+              className={soundCategory === 'voice' ? 'active' : ''}
+              aria-pressed={soundCategory === 'voice'}
+              onClick={() => setSoundCategory('voice')}
+            >
+              报牌与音色
+            </button>
+            <button
+              className={soundCategory === 'music' ? 'active' : ''}
+              aria-pressed={soundCategory === 'music'}
+              onClick={() => setSoundCategory('music')}
+            >
+              配乐与音量
+            </button>
+          </div>
+          {soundCategory === 'voice' && (
+            <section className="sound-section">
+              <h3>报牌声音</h3>
+              <p>每个座位一种声音，出牌和“不出”都能听出来。</p>
+              <button className="button primary full" onClick={toggleVoice}>
+                {voiceStatus.enabled && voiceStatus.unlocked ? '关闭报牌声音' : '开启报牌声音'}
+              </button>
+              <div className="voice-seats">
+                {VOICES.slice(0, room ? MODES[room.mode].players : 4).map((v, seat) => {
+                  const player = room?.players.find((p) => p.seat === seat);
+                  return (
+                    <div className="voice-seat" key={v.id}>
+                      <div>
+                        <strong>
+                          {player?.name ?? `第 ${seat + 1} 座`}
+                          {player?.id === room?.youId && player ? '（您）' : ''}
+                        </strong>
+                        <span>{seatVoice(seat).label}</span>
+                      </div>
+                      <button
+                        className="button light"
+                        onClick={() => voice.preview(seat)}
+                        aria-label={`试听第${seat + 1}座${v.label}`}
+                      >
+                        试听
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+              <p className="sound-caption">试听内容：对皮蛋、ace、炸弹。身份提醒使用清楚的女声。</p>
+              {soundLoading.phase === 'partial' && (
+                <p className="sound-caption" role="status">
+                  部分声音还没准备好，播放时会再试；仍可看文字继续玩。
+                </p>
+              )}
+            </section>
+          )}
+          {soundCategory === 'music' && (
+            <section className="sound-section">
+              <h3>经典风格配乐</h3>
+              <p>轻快拨弦小曲《家人围一桌》。</p>
+              <p className="sound-caption" role="status">
+                {musicStatus.playing
+                  ? '配乐正在播放'
+                  : musicStatus.enabled
+                    ? '配乐等待播放'
+                    : '配乐已关闭'}
+              </p>
+              <button
+                className="button light full"
+                onClick={() => (musicStatus.enabled ? music.stop() : music.start())}
+              >
+                {musicStatus.enabled ? '关闭配乐' : '开启配乐 ♪'}
+              </button>
+              {musicStatus.enabled && !musicStatus.playing && !musicStatus.error && (
+                <button className="text-link music-recover" onClick={() => music.start()}>
+                  点一下，播放配乐
+                </button>
+              )}
+              <label className="music-volume" htmlFor="music-volume">
+                配乐音量 <strong>{musicStatus.volume}%</strong>
+              </label>
+              <input
+                id="music-volume"
+                type="range"
+                min="0"
+                max="60"
+                step="5"
+                value={musicStatus.volume}
+                onChange={(e) => music.setVolume(Number(e.target.value))}
+              />
+              <p className="sound-caption">报牌时配乐自动让声。围桌时建议只在一部手机开启配乐。</p>
+            </section>
+          )}
+          <button className="button primary full" onClick={() => setSoundSettings(false)}>
+            好了，继续玩
           </button>
         </Modal>
       )}

@@ -1,0 +1,77 @@
+{
+  "provider": "Microsoft Edge online neural voices",
+  "toolVersion": "edge-tts==7.2.8",
+  "generatedOn": "2026-10-03",
+  "sourceVersion": "neural-v2",
+  "assetVersion": "classic-v2",
+  "reuseVersion": "neural-v1",
+  "voices": [
+    {
+      "id": "lively-male",
+      "voice": "zh-CN-YunxiNeural",
+      "rate": "+5%",
+      "pitch": "+0Hz"
+    },
+    {
+      "id": "warm-female",
+      "voice": "zh-CN-XiaoxiaoNeural",
+      "rate": "+9%",
+      "pitch": "+2Hz"
+    },
+    {
+      "id": "deep-male",
+      "voice": "zh-CN-YunjianNeural",
+      "rate": "+2%",
+      "pitch": "+0Hz"
+    },
+    {
+      "id": "bright-female",
+      "voice": "zh-CN-XiaoyiNeural",
+      "rate": "+6%",
+      "pitch": "+0Hz"
+    }
+  ],
+  "phoneticOverrides": {
+    "single-11": "钩。",
+    "pair-11": "对钩。",
+    "triple-11": "三个钩。",
+    "single-14": "Ace。",
+    "pair-14": "对Ace。",
+    "triple-14": "三个Ace。"
+  },
+  "review": {
+    "female": "用户认可bright小样，采用小晓+9%/+2Hz",
+    "male": "男声新小样声调与力度未通过，用户要求延后声调调试，保留neural-v1男声音色参数",
+    "deferred": "男声勾的阴平、其他字词和中气逐段听审"
+  },
+  "samples": [
+    {
+      "id": "strong",
+      "voice": "zh-CN-YunjianNeural",
+      "rate": "+8%",
+      "pitch": "+0Hz",
+      "text": "勾！对皮蛋！三个皮蛋！凯！Ace！对Ace！一分！三分！不要！炸弹！您是地主。您是农民。"
+    },
+    {
+      "id": "bright",
+      "voice": "zh-CN-XiaoxiaoNeural",
+      "rate": "+9%",
+      "pitch": "+2Hz",
+      "text": "勾！对皮蛋！三个皮蛋！凯！Ace！对Ace！一分！三分！不要！炸弹！您是地主。您是农民。"
+    },
+    {
+      "id": "male-xi",
+      "voice": "zh-CN-YunxiNeural",
+      "rate": "+0%",
+      "pitch": "+0Hz",
+      "text": "勾。皮蛋。对皮蛋。三个皮蛋。凯。Ace。对Ace。三个Ace。一分。三分。不叫。不要。炸弹。"
+    },
+    {
+      "id": "male-yang",
+      "voice": "zh-CN-YunyangNeural",
+      "rate": "+0%",
+      "pitch": "+0Hz",
+      "text": "勾。皮蛋。对皮蛋。三个皮蛋。凯。Ace。对Ace。三个Ace。一分。三分。不叫。不要。炸弹。"
+    }
+  ]
+}

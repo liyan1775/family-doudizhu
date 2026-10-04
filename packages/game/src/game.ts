@@ -1,7 +1,7 @@
 import { createDeck, shuffle, sortCards } from './cards.js';
 import { analyze, beats, comboAudio, describeCombo } from './rules.js';
 import { DEFAULT_PROFILE, MODES, PROFILES } from './types.js';
-import type { GameMode, GameState, Player, RuleProfile } from './types.js';
+import type { GameAnnouncement, GameMode, GameState, Player, RuleProfile } from './types.js';
 
 export function createGame(
   mode: GameMode,
@@ -42,8 +42,19 @@ export function announce(
   audio: string[] = [],
   kind: GameState['event']['kind'] = 'info',
   actorId?: string,
+  before: GameAnnouncement[] = [],
 ): void {
-  game.event = { id: game.event.id + 1, text, audio, kind, actorId };
+  const final = { text, audio, kind, actorId };
+  game.event = {
+    ...final,
+    id: game.event.id + 1,
+    ...(before.length
+      ? {
+          audio: [...before.flatMap((part) => part.audio), ...audio],
+          announcements: [...before, final],
+        }
+      : {}),
+  };
 }
 export function addPlayer(game: GameState, id: string, name: string): Player {
   if (game.phase !== 'waiting' && game.phase !== 'finished')
@@ -137,7 +148,7 @@ export function deal(game: GameState, randomInt?: (max: number) => number): void
   game.round++;
   announce(game, '发牌完成，开始叫地主', ['deal'], 'deal');
 }
-function chooseLandlord(game: GameState, id: string): void {
+function chooseLandlord(game: GameState, id: string, call: GameAnnouncement): void {
   game.landlordId = id;
   game.hands[id] = sortCards([...game.hands[id], ...game.bottom]);
   game.turnId = id;
@@ -148,6 +159,7 @@ function chooseLandlord(game: GameState, id: string): void {
     ['landlord'],
     'landlord',
     id,
+    [call],
   );
 }
 export function bid(
@@ -165,22 +177,22 @@ export function bid(
     game.highestBid = value;
     game.highestBidder = id;
   }
+  const call: GameAnnouncement = {
+    text: `${p.name}${value ? `叫${value}分` : '不叫'}`,
+    audio: [value ? `bid-${value}` : 'no-bid'],
+    kind: 'bid',
+    actorId: id,
+  };
   if (value === 3 || game.bidsTaken === game.players.length) {
-    if (game.highestBidder) chooseLandlord(game, game.highestBidder);
+    if (game.highestBidder) chooseLandlord(game, game.highestBidder, call);
     else {
       game.startingSeat = (game.startingSeat + 1) % game.players.length;
       deal(game, randomInt);
-      announce(game, '大家都不叫，重新发牌', ['redeal'], 'deal');
+      announce(game, '大家都不叫，重新发牌', ['redeal'], 'deal', undefined, [call]);
     }
   } else {
     game.turnId = nextPlayer(game, id);
-    announce(
-      game,
-      `${p.name}${value ? `叫${value}分` : '不叫'}`,
-      [value ? `bid-${value}` : 'no-bid'],
-      'bid',
-      id,
-    );
+    announce(game, call.text, call.audio, 'bid', id);
   }
 }
 export function rob(
@@ -191,13 +203,21 @@ export function rob(
 ): void {
   const p = requireTurn(game, id, ['calling', 'robbing']);
   const wasCalling = game.phase === 'calling';
+  const call: GameAnnouncement = {
+    text: `${p.name}${yes ? (wasCalling ? '叫地主' : '抢地主') : wasCalling ? '不叫' : '不抢'}`,
+    audio: [
+      yes ? (wasCalling ? 'call-landlord' : 'rob-landlord') : wasCalling ? 'no-bid' : 'no-rob',
+    ],
+    kind: 'bid',
+    actorId: id,
+  };
   if (yes) {
     game.highestBidder = id;
     game.robCount++;
     game.allowance = game.robCount;
     game.highestBid = [1, 2, 4, 5, 6][game.robCount];
     if (game.robCount === 4) {
-      chooseLandlord(game, id);
+      chooseLandlord(game, id, call);
       return;
     }
     game.phase = 'robbing';
@@ -214,12 +234,12 @@ export function rob(
     if (game.bidsTaken >= game.players.length) {
       game.startingSeat = (game.startingSeat + 1) % game.players.length;
       deal(game, randomInt);
-      announce(game, '大家都不叫，重新发牌', ['redeal'], 'deal');
+      announce(game, '大家都不叫，重新发牌', ['redeal'], 'deal', undefined, [call]);
     } else {
       game.turnId = nextPlayer(game, id);
       announce(game, `${p.name}不叫`, ['no-bid'], 'bid', id);
     }
-  } else chooseLandlord(game, game.highestBidder!);
+  } else chooseLandlord(game, game.highestBidder!, call);
 }
 export function bombLimit(game: GameState, id: string): number | null {
   if (game.profile !== 'four-jiangsu' || id === game.landlordId) return null;

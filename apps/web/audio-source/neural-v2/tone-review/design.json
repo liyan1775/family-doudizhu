@@ -1,0 +1,14 @@
+{
+  "purpose": "用户指出勾必须为阴平。单句生成，以钩规避多音字。",
+  "lines": {
+    "single-11": "钩。",
+    "pair-11": "对钩。",
+    "triple-11": "三个钩。"
+  },
+  "voices": {
+    "male-xi": "zh-CN-YunxiNeural",
+    "male-yang": "zh-CN-YunyangNeural"
+  },
+  "rate": "+0%",
+  "pitch": "+0Hz"
+}

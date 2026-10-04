@@ -41,12 +41,16 @@ export interface Play {
   cards: Card[];
   combo: Combo;
 }
-export interface GameEvent {
-  id: number;
+export interface GameAnnouncement {
   kind: 'ready' | 'deal' | 'bid' | 'landlord' | 'play' | 'pass' | 'finish' | 'info';
   text: string;
   audio: string[];
   actorId?: string;
+}
+export interface GameEvent extends GameAnnouncement {
+  id: number;
+  /** Ordered announcements from one action; each retains its own speaker. */
+  announcements?: GameAnnouncement[];
 }
 export interface Settlement {
   playerId: string;
@@ -102,6 +106,15 @@ export interface RoomView {
   allowance: number;
   robCount: number;
   bombLimits: Record<string, { used: number; limit: number | null }>;
+}
+/** Public lobby metadata; private seat identities and cards are never included. */
+export interface RoomSummary {
+  roomId: string;
+  hostName: string;
+  mode: GameMode;
+  profile: RuleProfile;
+  playerCount: number;
+  maxPlayers: number;
 }
 export interface Session {
   roomId: string;

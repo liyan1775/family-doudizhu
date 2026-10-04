@@ -1,6 +1,6 @@
 {
   "name": "family-doudizhu",
-  "version": "0.1.0",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "description": "家人微信扫码参与的聚会斗地主",
@@ -12,10 +12,11 @@
     "dev:server": "tsx watch --env-file-if-exists=.env apps/server/src/index.ts",
     "dev:web": "vite --config apps/web/vite.config.ts --host 0.0.0.0",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/*.test.ts",
+    "test": "tsx --test tests/*.test.ts tests/*.test.mjs",
     "build": "npm run typecheck && vite build --config apps/web/vite.config.ts && node scripts/build-server.mjs",
     "start": "node --env-file-if-exists=.env dist/server/index.js",
-    "voice:generate": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/generate-voice.ps1"
+    "voice:generate": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/generate-voice.ps1",
+    "audio:generate": "node scripts/generate-classic-audio.mjs"
   },
   "dependencies": {
     "express": "^5.2.1",
