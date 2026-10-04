@@ -8,11 +8,13 @@ import { isIP } from 'node:net';
 import QRCode from 'qrcode';
 import { Server, type Socket } from 'socket.io';
 import packageInfo from '../../../package.json' with { type: 'json' };
+import { TurnClock } from './turn-clock.js';
 import {
   addPlayer,
   announce,
   bid,
   bombLimit,
+  cancelRound,
   createGame,
   DEFAULT_PROFILE,
   MODES,
@@ -43,6 +45,7 @@ interface Room {
   game: GameState;
   sessions: Map<string, SeatSession>;
   touchedAt: number;
+  clock: TurnClock;
 }
 interface Binding {
   room: Room;
@@ -53,6 +56,7 @@ export interface ServerOptions {
   staticPath?: string;
   projectDirectory?: string;
   temporaryPublic?: boolean;
+  turnDurationMs?: number;
 }
 
 export interface PublicEntry {
@@ -69,6 +73,9 @@ export function makeServer(options: ServerOptions = {}) {
   const bindings = new WeakMap<Socket, Binding>();
   const requestCounts = new Map<string, { count: number; resetAt: number }>();
   const instanceId = randomUUID();
+  const turnDuration = options.turnDurationMs ?? 30_000;
+  if (!Number.isFinite(turnDuration) || turnDuration <= 0) throw new Error('出牌时间必须大于0');
+  const entries = new Map<string, { fingerprint: string; session: Session; expiresAt: number }>();
   let publicEntry: PublicEntry = { status: 'connecting' };
   const entryMode = options.temporaryPublic ? 'temporary' : options.publicBaseUrl ? 'fixed' : 'lan';
 
@@ -91,20 +98,10 @@ export function makeServer(options: ServerOptions = {}) {
         : {}),
     });
   });
-  app.get('/api/config', (_req, res) => {
-    res.setHeader('Cache-Control', 'no-store');
-    if (options.temporaryPublic) {
-      res.json({
-        entryMode,
-        publicStatus: publicEntry.status,
-        publicBaseUrl: publicEntry.status === 'ready' ? publicEntry.url : null,
-        localUrls: [],
-      });
-      return;
-    }
+  function localEntryUrls() {
     const address = http.address();
     const port = address && typeof address !== 'string' ? address.port : 3000;
-    const localUrls = [
+    return [
       ...new Set(
         Object.values(networkInterfaces()).flatMap((items) =>
           (items ?? [])
@@ -116,15 +113,49 @@ export function makeServer(options: ServerOptions = {}) {
         ),
       ),
     ];
+  }
+  function isDirectLocalRequest(req: express.Request) {
+    // A tunnel request always carries the visitor header. Never publish LAN
+    // addresses through it, even when the visitor happens to use the home Wi-Fi.
+    if (req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']) return false;
+    const address = (req.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
+    return (
+      address === '::1' ||
+      /^127\./.test(address) ||
+      /^10\./.test(address) ||
+      /^192\.168\./.test(address) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(address)
+    );
+  }
+  app.get('/api/config', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    if (options.temporaryPublic) {
+      res.json({
+        entryMode,
+        publicStatus: publicEntry.status,
+        publicBaseUrl: publicEntry.status === 'ready' ? publicEntry.url : null,
+        localUrls: isDirectLocalRequest(req) ? localEntryUrls() : [],
+      });
+      return;
+    }
     res.json({
       entryMode,
       publicBaseUrl: options.publicBaseUrl?.replace(/\/$/, '') || null,
-      localUrls,
+      localUrls: localEntryUrls(),
     });
   });
   app.get('/api/invite.png', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
-    if (!options.temporaryPublic || publicEntry.status !== 'ready' || !publicEntry.url) {
+    const lanInvite = req.query.network === 'lan';
+    const lanUrls = isDirectLocalRequest(req) ? localEntryUrls() : [];
+    const base = lanInvite
+      ? typeof req.query.address === 'string'
+        ? lanUrls.find((url) => url === req.query.address)
+        : (lanUrls.find((url) => new URL(url).host === req.headers.host) ?? lanUrls[0])
+      : publicEntry.status === 'ready'
+        ? publicEntry.url
+        : undefined;
+    if (!options.temporaryPublic || !base) {
       res.status(503).send('公网入口尚未连通，请等待二维码重新显示');
       return;
     }
@@ -136,7 +167,7 @@ export function makeServer(options: ServerOptions = {}) {
       res.status(404).send('这桌已结束，请使用本次新二维码');
       return;
     }
-    const target = `${publicEntry.url}${roomId ? `/?room=${roomId}` : ''}`;
+    const target = `${base}${roomId ? `/?room=${roomId}` : ''}`;
     const png = await QRCode.toBuffer(target, {
       type: 'png',
       width: 440,
@@ -201,6 +232,8 @@ export function makeServer(options: ServerOptions = {}) {
       hand: g.hands[playerId] ?? [],
       bottom: showBottom ? g.bottom : [],
       turnId: g.turnId,
+      serverTime: Date.now(),
+      turnDeadline: room.clock.deadline,
       landlordId: g.landlordId,
       highestBid: g.highestBid,
       round: g.round,
@@ -218,10 +251,64 @@ export function makeServer(options: ServerOptions = {}) {
     };
   }
   function broadcast(room: Room) {
+    room.clock.sync(room.game);
     room.touchedAt = Date.now();
     for (const [playerId, session] of room.sessions) {
       if (session.socketId) io.to(session.socketId).emit('room-state', view(room, playerId));
     }
+  }
+  function removeSeat(room: Room, playerId: string, changingTables = false) {
+    const name = room.game.players.find((p) => p.id === playerId)!.name;
+    const activeRound = !['waiting', 'finished'].includes(room.game.phase);
+    const previousSocketId = room.sessions.get(playerId)?.socketId;
+    const previous = previousSocketId ? io.sockets.sockets.get(previousSocketId) : undefined;
+    if (previous) {
+      bindings.delete(previous);
+      if (changingTables) {
+        previous.emit('session-replaced');
+        previous.disconnect(true);
+      }
+    }
+    if (activeRound || room.game.phase === 'finished') cancelRound(room.game);
+    room.game.players = room.game.players.filter((p) => p.id !== playerId);
+    room.game.players.forEach((p) => {
+      p.ready = false;
+    });
+    room.sessions.delete(playerId);
+    delete room.game.hands[playerId];
+    if (!room.game.players.length) {
+      room.clock.stop();
+      rooms.delete(room.id);
+    } else {
+      if (room.hostId === playerId) room.hostId = room.game.players[0].id;
+      announce(
+        room.game,
+        activeRound
+          ? `${name}换桌了，本局结束不计分，请重新准备`
+          : `${name}${changingTables ? '换桌' : '离开'}了，等待家人入座`,
+        activeRound ? ['next-round'] : [],
+      );
+      broadcast(room);
+    }
+  }
+  function expireTurn(room: Room) {
+    if (
+      !rooms.has(room.id) ||
+      room.game.phase !== 'playing' ||
+      !room.game.turnId ||
+      room.game.players.some((p) => !p.online)
+    )
+      return;
+    const playerId = room.game.turnId;
+    if (room.game.lastPlay) {
+      pass(room.game, playerId);
+      room.game.event.text += '（超时自动不出）';
+    } else {
+      const smallest = room.game.hands[playerId].reduce((a, b) => (a.rank <= b.rank ? a : b));
+      playCards(room.game, playerId, [smallest.id]);
+      room.game.event.text += '（超时自动出牌）';
+    }
+    broadcast(room);
   }
   function getBinding(socket: Socket): Binding {
     const binding = bindings.get(socket);
@@ -264,11 +351,14 @@ export function makeServer(options: ServerOptions = {}) {
   const expiry = setInterval(() => {
     const now = Date.now();
     for (const [key, room] of rooms) {
-      if (room.game.players.every((p) => !p.online) && now - room.touchedAt > 12 * 60 * 60 * 1000)
+      if (room.game.players.every((p) => !p.online) && now - room.touchedAt > 12 * 60 * 60 * 1000) {
+        room.clock.stop();
         rooms.delete(key);
+      }
     }
     for (const [key, counter] of requestCounts)
       if (counter.resetAt < now) requestCounts.delete(key);
+    for (const [key, entry] of entries) if (entry.expiresAt < now) entries.delete(key);
   }, 60_000);
   expiry.unref();
 
@@ -278,8 +368,8 @@ export function makeServer(options: ServerOptions = {}) {
         if (typeof ack !== 'function') return;
         const respond = ack as (reply: Ack<unknown>) => void;
         try {
-          // Only the loopback-only temporary host trusts Cloudflare's visitor
-          // address. Do not trust arbitrary forwarded headers on a LAN host.
+          // Only loopback requests from the temporary tunnel trust the visitor
+          // address. Direct LAN sockets keep their actual peer address.
           const forwarded = socket.handshake.headers['cf-connecting-ip'];
           const loopback = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(
             socket.handshake.address,
@@ -329,6 +419,7 @@ export function makeServer(options: ServerOptions = {}) {
         game: createGame(mode, profile),
         sessions: new Map(),
         touchedAt: Date.now(),
+        clock: new TurnClock(turnDuration, () => expireTurn(room)),
       };
       addPlayer(room.game, playerId, name);
       room.sessions.set(playerId, { token: randomBytes(32).toString('base64url'), socketId: null });
@@ -348,6 +439,83 @@ export function makeServer(options: ServerOptions = {}) {
       addPlayer(room.game, playerId, name);
       room.sessions.set(playerId, { token: randomBytes(32).toString('base64url'), socketId: null });
       return attach(socket, room, playerId);
+    });
+    on('enter-room', (data) => {
+      if (typeof data?.roomId !== 'string' || !/^\d{6}$/.test(data.roomId))
+        throw new Error('请输入6位房间号');
+      if (typeof data?.requestId !== 'string' || !/^[a-zA-Z0-9-]{16,80}$/.test(data.requestId))
+        throw new Error('入座请求不正确，请重新扫码');
+      const fingerprint = createHash('sha256')
+        .update(
+          JSON.stringify({
+            roomId: data.roomId,
+            name: data.name,
+            previous: data.previousSession,
+          }),
+        )
+        .digest('hex');
+      const cached = entries.get(data.requestId);
+      if (cached && cached.expiresAt > Date.now()) {
+        if (cached.fingerprint !== fingerprint) throw new Error('入座请求已经变更，请重新扫码');
+        const destination = rooms.get(cached.session.roomId);
+        if (destination?.sessions.get(cached.session.playerId)?.token === cached.session.token) {
+          const bound = bindings.get(socket);
+          if (bound && (bound.room !== destination || bound.playerId !== cached.session.playerId))
+            throw new Error('您已在另一桌，请重新扫码');
+          return attach(socket, destination, cached.session.playerId);
+        }
+        throw new Error('这次入座已失效，请重新扫码');
+      }
+      const previous = data.previousSession as Session | undefined;
+      const oldRoom = previous && rooms.get(previous.roomId);
+      const oldSeat = oldRoom?.sessions.get(previous!.playerId);
+      if (oldSeat && (typeof previous?.token !== 'string' || oldSeat.token !== previous.token))
+        throw new Error('原座位身份不正确，请回原页面重新入座');
+      const bound = bindings.get(socket);
+      if (bound && (!oldSeat || bound.room !== oldRoom || bound.playerId !== previous?.playerId))
+        throw new Error('您已在另一桌，请重新扫码');
+      const destination = rooms.get(data.roomId);
+      if (!destination) throw new Error('没有找到这桌，请让房主重新展示二维码');
+      let result: Session;
+      if (oldSeat && oldRoom === destination) {
+        result = attach(socket, destination, previous!.playerId);
+        announce(
+          destination.game,
+          `${destination.game.players.find((p) => p.id === result.playerId)!.name}回来了`,
+        );
+      } else {
+        const name = nameFrom(
+          data.name ?? oldRoom?.game.players.find((p) => p.id === previous?.playerId)?.name,
+        );
+        if (!['waiting', 'finished'].includes(destination.game.phase))
+          throw new Error('已经开局，请等这一局结束');
+        if (destination.game.players.length >= MODES[destination.game.mode].players)
+          throw new Error('这桌已坐满，请另开一桌');
+        if (destination.game.players.some((p) => p.name === name))
+          throw new Error('这个称呼已有人使用，请加个字区分');
+        // Validate the destination before changing the old round or identity.
+        const playerId = randomUUID();
+        if (oldSeat && oldRoom) {
+          // A same-socket switch must keep the transport open.
+          if (oldSeat.socketId === socket.id) {
+            bindings.delete(socket);
+            oldSeat.socketId = null;
+          }
+          removeSeat(oldRoom, previous!.playerId, true);
+        }
+        addPlayer(destination.game, playerId, name);
+        destination.sessions.set(playerId, {
+          token: randomBytes(32).toString('base64url'),
+          socketId: null,
+        });
+        result = attach(socket, destination, playerId);
+      }
+      entries.set(data.requestId, {
+        fingerprint,
+        session: result,
+        expiresAt: Date.now() + 120_000,
+      });
+      return result;
     });
     on('resume-room', (data) => {
       if (bindings.has(socket)) throw new Error('已经入座');
@@ -397,21 +565,8 @@ export function makeServer(options: ServerOptions = {}) {
       checkRevision(room.game, data);
       if (!['waiting', 'finished'].includes(room.game.phase))
         throw new Error('这一局还没结束，请打完再离开');
-      if (room.game.phase === 'finished') resetRound(room.game);
-      const name = room.game.players.find((p) => p.id === playerId)!.name;
-      room.game.players = room.game.players.filter((p) => p.id !== playerId);
-      room.game.players.forEach((p) => {
-        p.ready = false;
-      });
-      room.sessions.delete(playerId);
-      delete room.game.hands[playerId];
       bindings.delete(socket);
-      if (!room.game.players.length) rooms.delete(room.id);
-      else {
-        if (room.hostId === playerId) room.hostId = room.game.players[0].id;
-        announce(room.game, `${name}离开了，等待家人入座`);
-        broadcast(room);
-      }
+      removeSeat(room, playerId);
     });
     socket.on('disconnect', () => {
       const binding = bindings.get(socket);
@@ -449,6 +604,7 @@ export function makeServer(options: ServerOptions = {}) {
     },
     close: async () => {
       clearInterval(expiry);
+      for (const room of rooms.values()) room.clock.stop();
       await new Promise<void>((done) => io.close(() => done()));
     },
   };

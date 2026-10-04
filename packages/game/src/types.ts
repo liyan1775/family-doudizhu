@@ -97,6 +97,9 @@ export interface RoomView {
   landlordId: string | null;
   highestBid: number;
   round: number;
+  /** Server time and deadline; absent on hosts from earlier releases. */
+  serverTime?: number;
+  turnDeadline?: number | null;
   lastPlay: Play | null;
   multiplier: number;
   settlement: Settlement[];

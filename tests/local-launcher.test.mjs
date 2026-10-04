@@ -120,6 +120,9 @@ test('启动配置遵循环境变量优先级，错误端口和网址给出中�
   const fromFile = await readConfig(f.directory, {});
   assert.equal(fromFile.port, 32100);
   assert.equal((await readConfig(f.directory, { PORT: '32101' })).port, 32101);
+  const dual = await readConfig(f.directory, { HOST: '127.0.0.1' }, 'public');
+  assert.equal(dual.host, '0.0.0.0');
+  assert.equal(dual.base(32100), 'http://127.0.0.1:32100');
   for (const port of ['0', '65536', '3.5', 'oops', '']) {
     await assert.rejects(readConfig(f.directory, { PORT: port }), /PORT.*1到65535/);
   }

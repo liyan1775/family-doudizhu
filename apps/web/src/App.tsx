@@ -23,11 +23,18 @@ import { VoicePlayer, type VoiceStatus } from './voice.js';
 import { MusicPlayer, type MusicStatus } from './music.js';
 import { seatVoice, VOICES } from './audio-catalog.js';
 import { RoomDirectory } from './RoomDirectory.js';
-import { isPublicEntry, phoneEntryUrls, type EntryConfig } from './phone-links.js';
+import {
+  isPublicEntry,
+  phoneEntryUrls,
+  phoneLanUrls,
+  phonePublicUrl,
+  type EntryConfig,
+} from './phone-links.js';
 import { RoomFeedback, isActionTurn } from './room-feedback.js';
 import { TurnCue } from './turn-cue.js';
 import { handLayout } from './hand-layout.js';
 import { createGameConnection } from './connection.js';
+import { entryIntent, entryRequestId, tableSeat } from './entry-session.js';
 
 type Config = EntryConfig;
 const SESSION_KEY = 'family-doudizhu-session';
@@ -117,7 +124,7 @@ function HandCards({
       window.removeEventListener('resize', measure);
     };
   }, [compact, scrollRef]);
-  const layout = handLayout(cards.length, size.width, size.height);
+  const layout = handLayout(cards.length, size.width, size.height, compact);
   const renderCard = (card: Card) => (
     <PlayingCard
       key={card.id}
@@ -227,6 +234,8 @@ export function App() {
   const revealActive = useRef(false);
   const handScroll = useRef<HTMLDivElement>(null);
   const latestRoom = useRef<RoomView | null>(null);
+  const entryReceipt = useRef<{ fingerprint: string; id: string } | null>(null);
+  const [secondsLeft, setSecondsLeft] = useState<number | null>(null);
   latestRoom.current = room;
   function cancelReveal() {
     clearTimeout(revealTimer.current);
@@ -236,6 +245,20 @@ export function App() {
   function unlockVoice() {
     cue.unlock();
     voice.unlock();
+  }
+  function entryPayload(payload: object) {
+    const fingerprint = JSON.stringify(payload);
+    if (entryReceipt.current?.fingerprint !== fingerprint)
+      entryReceipt.current = { fingerprint, id: entryRequestId() };
+    return { ...payload, requestId: entryReceipt.current.id };
+  }
+  function saveSeat(session: Session) {
+    localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+    const savedName = name.trim() || localStorage.getItem('family-name');
+    if (savedName) localStorage.setItem('family-name', savedName);
+    history.replaceState(null, '', `/?room=${session.roomId}`);
+    setRoomNumber(session.roomId);
+    setPhoneInvite(false);
   }
 
   useEffect(() => {
@@ -267,24 +290,46 @@ export function App() {
     document.addEventListener('visibilitychange', visibility);
     const s = createGameConnection();
     setSocket(s);
+    let connectionGeneration = 0;
+    let entryRetry: ReturnType<typeof setTimeout> | undefined;
     s.on('connect', () => {
+      const generation = ++connectionGeneration;
+      clearTimeout(entryRetry);
       setConnected(true);
       setReplaced(false);
       const session = readSession();
-      if (session)
-        s.timeout(6000).emit(
-          'resume-room',
-          session,
+      const invitation = new URLSearchParams(location.search).get('room') ?? '';
+      const intent = entryIntent(invitation, session, localStorage.getItem('family-name') ?? '');
+      if (!intent) {
+        setBusy(false);
+        return;
+      }
+      const payload = intent.event === 'enter-room' ? entryPayload(intent.payload) : intent.payload;
+      const enterSeat = () => {
+        if (!s.connected || generation !== connectionGeneration) return;
+        setBusy(true);
+        s.timeout(6000).volatile.emit(
+          intent.event,
+          payload,
           (error: Error | null, result: Ack<Session>) => {
+            if (!s.connected || generation !== connectionGeneration) return;
             if (error) {
-              setMessage('恢复房间超时，请刷新页面重试');
+              setMessage('入座回复较慢，正在重试，请保持页面打开');
+              entryRetry = setTimeout(enterSeat, 1500);
+              return;
+            }
+            setBusy(false);
+            if (result.ok && result.data) {
+              saveSeat(result.data);
+              setMessage('');
               return;
             }
             if (!result.ok) {
-              if (readSession()?.token === session.token) localStorage.removeItem(SESSION_KEY);
+              if (intent.event === 'resume-room' && readSession()?.token === session?.token)
+                localStorage.removeItem(SESSION_KEY);
               setRoom(null);
               feedback.suspend();
-              if (new URLSearchParams(location.search).get('room') === session.roomId) {
+              if (intent.event === 'resume-room' && invitation === session?.roomId) {
                 history.replaceState(null, '', '/');
                 setRoomNumber('');
               }
@@ -292,8 +337,13 @@ export function App() {
             }
           },
         );
+      };
+      enterSeat();
     });
     s.on('disconnect', () => {
+      connectionGeneration++;
+      clearTimeout(entryRetry);
+      setBusy(false);
       setConnected(false);
       voice.clear();
       cue.clear();
@@ -340,11 +390,20 @@ export function App() {
       } else if (signal.cue && !revealActive.current) {
         cue.play(voice.enabled && voice.unlocked);
       }
+      const previousState = latestRoom.current;
+      const changedTurn =
+        previousState?.roomId !== state.roomId ||
+        previousState?.round !== state.round ||
+        previousState?.turnId !== state.turnId ||
+        previousState?.phase !== state.phase;
       latestRoom.current = state;
       setRoom(state);
-      setSelected((current) => current.filter((id) => state.hand.some((c) => c.id === id)));
+      setSelected((current) =>
+        changedTurn ? [] : current.filter((id) => state.hand.some((c) => c.id === id)),
+      );
     });
     return () => {
+      clearTimeout(entryRetry);
       s.disconnect();
       document.removeEventListener('visibilitychange', visibility);
       voice.dispose();
@@ -371,16 +430,9 @@ export function App() {
         if (!Array.isArray(data.localUrls)) throw new Error();
         if (!active) return;
         setConfig(data);
-        const urls = phoneEntryUrls(data);
-        if (data.entryMode === 'temporary') setInviteBase(urls[0] || '');
-        else {
-          const base = data.publicBaseUrl
-            ? urls[0] || ''
-            : localHost
-              ? urls[0] || ''
-              : location.origin;
-          setInviteBase((current) => (urls.includes(current) ? current : base));
-        }
+        const urls = phoneEntryUrls(data, 'lan');
+        const base = !localHost && urls.includes(location.origin) ? location.origin : urls[0] || '';
+        setInviteBase((current) => (urls.includes(current) ? current : base));
       } catch {
         if (active) setInviteBase('');
       } finally {
@@ -408,6 +460,25 @@ export function App() {
     if (room) voice.prepare(Array.from({ length: MODES[room.mode].players }, (_, seat) => seat));
   }, [voice, room?.roomId, room?.mode]);
 
+  const landscapeTable = !!room && room.phase !== 'waiting';
+  useEffect(() => {
+    document.body.classList.toggle('playing-landscape', landscapeTable);
+    return () => document.body.classList.remove('playing-landscape');
+  }, [landscapeTable]);
+  useEffect(() => {
+    if (!room?.turnDeadline || !room.serverTime) {
+      setSecondsLeft(null);
+      return;
+    }
+    const remaining = room.turnDeadline - room.serverTime;
+    const received = performance.now();
+    const update = () =>
+      setSecondsLeft(Math.max(0, Math.ceil((remaining - (performance.now() - received)) / 1000)));
+    update();
+    const timer = window.setInterval(update, 250);
+    return () => clearInterval(timer);
+  }, [room]);
+
   useEffect(() => {
     if (!message) return;
     const timer = window.setTimeout(() => setMessage(''), 8000);
@@ -415,6 +486,7 @@ export function App() {
   }, [message]);
   const joinUrl = room && inviteBase ? `${inviteBase}/?room=${room.roomId}` : '';
   const publicMode = isPublicEntry(config);
+  const publicInvite = publicMode && !!inviteBase && inviteBase === phonePublicUrl(config);
   const qrTarget = phoneInvite ? inviteBase : joinUrl;
   useEffect(() => {
     let current = true;
@@ -496,15 +568,19 @@ export function App() {
     setBusy(true);
     setMessage('');
     try {
-      const session = await request<Session>(create ? 'create-room' : 'join-room', {
+      const payload = {
         name,
         mode,
         profile,
         roomId: joinRoomNumber,
-      });
+        ...(create ? {} : { previousSession: readSession() ?? undefined }),
+      };
+      const session = await request<Session>(
+        create ? 'create-room' : 'enter-room',
+        create ? payload : entryPayload(payload),
+      );
       if (session) {
-        setPhoneInvite(false);
-        localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+        saveSeat(session);
         localStorage.setItem('family-name', name.trim());
         history.replaceState(null, '', `/?room=${session.roomId}`);
         if (create) setInvite(true);
@@ -550,6 +626,7 @@ export function App() {
   const inGame = !!room && !['waiting', 'finished'].includes(room.phase);
   const myTurn = !!room && room.turnId === room.youId;
   const allOnline = room?.players.every((p) => p.online) ?? true;
+  const visibleSeconds = connected && allOnline ? secondsLeft : null;
   const canAct = connected && !busy && allOnline && !landlordReveal;
   const turnName = room?.players.find((p) => p.id === room.turnId)?.name;
   const landlordName = room?.players.find((p) => p.id === room.landlordId)?.name;
@@ -587,7 +664,7 @@ export function App() {
 
   return (
     <div
-      className={`app ${room ? 'in-room' : ''} ${inGame ? 'game-active' : ''} ${inGame && myTurn && connected && allOnline && !landlordReveal ? 'my-turn' : ''}`}
+      className={`app ${room ? 'in-room' : ''} ${landscapeTable ? 'game-active table-landscape' : ''} ${inGame && myTurn && connected && allOnline && !landlordReveal ? 'my-turn' : ''}`}
     >
       <header className="topbar">
         <a
@@ -604,7 +681,8 @@ export function App() {
         >
           <span className="brand-mark">♠</span>
           <span>
-            聚会斗地主<small>家人围一桌</small>
+            聚会斗地主
+            <small>{landscapeTable ? `房间 ${room?.roomId} · 横放手机玩` : '家人围一桌'}</small>
           </span>
         </a>
         <div className="top-actions">
@@ -623,7 +701,7 @@ export function App() {
             <span>{voiceStatus.unlocked && voiceStatus.enabled ? '♪' : '♫'}</span>
             {inGame && voiceStatus.enabled && !voiceStatus.unlocked ? '恢复声音' : '声音设置'}
           </button>
-          {inGame ? (
+          {landscapeTable ? (
             <button className="table-info-button" onClick={() => setTableInfo(true)}>
               牌桌
             </button>
@@ -866,7 +944,9 @@ export function App() {
           </footer>
         </main>
       ) : (
-        <main className={`room-page ${room.allowance > 0 ? 'with-allowance' : ''}`}>
+        <main
+          className={`room-page mode-${room.mode} ${room.allowance > 0 ? 'with-allowance' : ''}`}
+        >
           <div className="room-heading">
             <div>
               <span className="eyebrow">
@@ -898,13 +978,13 @@ export function App() {
               return (
                 <div
                   key={seat}
-                  className={`player-seat ${p?.id === room.youId ? 'own-seat' : ''} ${p?.id === room.turnId ? 'current' : ''} ${!p ? 'empty' : ''} ${p && !p.online ? 'offline-seat' : ''}`}
+                  className={`player-seat ${tableSeat(seat, me?.seat ?? 0, MODES[room.mode].players)} ${p?.id === room.youId ? 'own-seat' : ''} ${p?.id === room.turnId ? 'current' : ''} ${!p ? 'empty' : ''} ${p && !p.online ? 'offline-seat' : ''}`}
                 >
                   <div className="avatar">{p ? [...p.name][0] : '+'}</div>
                   <strong>
                     {p ? `${p.name}${p.id === room.youId ? '（您）' : ''}` : '等家人'}
                   </strong>
-                  {inGame && p ? (
+                  {landscapeTable && p ? (
                     <>
                       <span className="remaining-count">
                         <b>{p.cardCount}</b> 张
@@ -988,8 +1068,18 @@ export function App() {
                     {room.multiplier}
                   </span>
                 </div>
-                <div className="turn-banner" aria-live="polite">
-                  {turnText}
+                <div className="turn-banner">
+                  <span aria-live="polite">{turnText}</span>
+                  {room.phase === 'playing' && (
+                    <span
+                      className={`turn-countdown ${visibleSeconds !== null && visibleSeconds <= 5 ? 'urgent' : ''}`}
+                      aria-label={
+                        visibleSeconds === null ? '倒计时暂停' : `本回合还剩${visibleSeconds}秒`
+                      }
+                    >
+                      {visibleSeconds === null ? '暂停' : `${visibleSeconds}秒`}
+                    </span>
+                  )}
                 </div>
                 {landlordReveal && (
                   <div className="landlord-reveal" role="status">
@@ -1083,7 +1173,7 @@ export function App() {
               <section className="hand-area" id="your-hand">
                 <div className="hand-heading">
                   <h2>
-                    您的手牌 <span>{room.hand.length}张</span>
+                    {me?.name}（您） <span>· {room.hand.length}张</span>
                   </h2>
                   <span>
                     {room.landlordId === room.youId
@@ -1096,7 +1186,7 @@ export function App() {
                 <HandCards
                   cards={room.hand}
                   selected={selected}
-                  compact={inGame}
+                  compact={landscapeTable}
                   scrollRef={handScroll}
                   onSelect={
                     room.phase === 'playing' && myTurn && canAct
@@ -1284,10 +1374,32 @@ export function App() {
           <p className="modal-description">
             {phoneInvite ? '房主用微信扫一扫，在手机上开桌，再邀请家人。' : '请家人用微信扫一扫，'}
             <br />
-            {publicMode
+            {publicInvite
               ? 'Wi-Fi 或手机流量都能加入，无需安装软件。'
               : '所有手机和电脑连接同一个 Wi-Fi。'}
           </p>
+          {phoneLanUrls(config).length > 0 && publicMode && (
+            <div className="invite-networks" aria-label="选择邀请方式">
+              <button
+                className={`button ${!publicInvite ? 'primary' : 'light'}`}
+                onClick={() =>
+                  setInviteBase(
+                    phoneLanUrls(config).find((url) => url === location.origin) ??
+                      phoneLanUrls(config)[0],
+                  )
+                }
+              >
+                同一 Wi-Fi · 更快
+              </button>
+              <button
+                className={`button ${publicInvite ? 'primary' : 'light'}`}
+                disabled={!phonePublicUrl(config)}
+                onClick={() => setInviteBase(phonePublicUrl(config) ?? '')}
+              >
+                异地／流量
+              </button>
+            </div>
+          )}
           {qr && qrTarget ? (
             <img
               className="qr-image"
@@ -1303,17 +1415,20 @@ export function App() {
                   : '没有找到局域网地址，请连接 Wi-Fi 后刷新'}
             </div>
           )}
-          {publicMode && qr && qrTarget && (
+          {qr && qrTarget && (
             <a
               className="button light full"
               href={
                 config.entryMode === 'temporary'
-                  ? `/api/invite.png${phoneInvite ? '' : `?room=${room?.roomId}`}`
+                  ? `/api/invite.png?${new URLSearchParams({
+                      ...(phoneInvite ? {} : { room: room!.roomId }),
+                      ...(!publicInvite ? { network: 'lan', address: inviteBase } : {}),
+                    })}`
                   : qr
               }
               download="聚会斗地主-房间邀请.png"
             >
-              保存二维码，发给家人
+              {publicInvite ? '保存二维码，发给远方家人' : '保存同一 Wi-Fi 邀请码'}
             </a>
           )}
           {!phoneInvite && room && (
@@ -1331,7 +1446,7 @@ export function App() {
           <details className="connection-help">
             <summary>扫码打不开？</summary>
             <p>
-              {publicMode ? (
+              {publicInvite ? (
                 '请使用本次启动的二维码，确认手机和主机电脑都能上网。微信提示打不开时，可在手机浏览器尝试。'
               ) : (
                 <>
@@ -1345,10 +1460,13 @@ export function App() {
               value={inviteBase}
               onChange={(e) => setInviteBase(e.target.value)}
             >
-              {phoneEntryUrls({
-                ...config,
-                localUrls: [...config.localUrls, ...(localHost ? [] : [location.origin])],
-              }).map((url) => (
+              {phoneEntryUrls(
+                {
+                  ...config,
+                  localUrls: [...config.localUrls, ...(localHost ? [] : [location.origin])],
+                },
+                'lan',
+              ).map((url) => (
                 <option key={url} value={url}>
                   {url}
                 </option>

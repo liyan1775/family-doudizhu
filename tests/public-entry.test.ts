@@ -27,7 +27,7 @@ test('公网二维码只在入口就绪时生成，中断不退回局域网或�
   );
 });
 
-test('临时公网配置不公开内网地址，状态更新仅由进程接口接收，旧地址不能缓存', async (t) => {
+test('经隧道访问不公开内网地址，直连可读取同实例局域网入口，状态更新只走进程接口', async (t) => {
   const server = makeServer({ temporaryPublic: true, publicBaseUrl: 'http://192.168.1.8:3000' });
   await new Promise<void>((done) => server.http.listen(0, '127.0.0.1', done));
   t.after(() => server.close());
@@ -35,7 +35,9 @@ test('临时公网配置不公开内网地址，状态更新仅由进程接口�
   assert.ok(address && typeof address !== 'string');
   const base = `http://127.0.0.1:${address.port}`;
   const read = async () => {
-    const response = await fetch(base + '/api/config');
+    const response = await fetch(base + '/api/config', {
+      headers: { 'CF-Connecting-IP': '198.51.100.9' },
+    });
     assert.equal(response.headers.get('cache-control'), 'no-store');
     return response.json();
   };
@@ -45,6 +47,24 @@ test('临时公网配置不公开内网地址，状态更新仅由进程接口�
     publicBaseUrl: null,
     localUrls: [],
   });
+  const direct = await (await fetch(base + '/api/config')).json();
+  assert.ok(Array.isArray(direct.localUrls));
+  assert.ok(direct.localUrls.every((url: string) => url.endsWith(`:${address.port}`)));
+  assert.equal(
+    (
+      await fetch(base + '/api/invite.png?network=lan', {
+        headers: { 'CF-Connecting-IP': '198.51.100.9' },
+      })
+    ).status,
+    503,
+  );
+  if (direct.localUrls.length) {
+    assert.equal((await fetch(base + '/api/invite.png?network=lan')).status, 200);
+    assert.equal(
+      (await fetch(base + '/api/invite.png?network=lan&address=https://attacker.example')).status,
+      503,
+    );
+  }
   assert.throws(
     () => server.setPublicEntry({ status: 'ready', url: 'https://bad.example/?target=local' }),
     /地址不正确/,

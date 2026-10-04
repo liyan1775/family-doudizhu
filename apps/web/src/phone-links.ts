@@ -27,12 +27,16 @@ function phoneUrl(value: string): string | null {
   }
 }
 
-export function phoneEntryUrls(config: EntryConfig): string[] {
+export function phonePublicUrl(config: EntryConfig): string | null {
   if (config.entryMode === 'temporary') {
-    if (config.publicStatus !== 'ready' || !config.publicBaseUrl) return [];
+    if (config.publicStatus !== 'ready' || !config.publicBaseUrl) return null;
     const published = phoneUrl(config.publicBaseUrl);
-    return published?.startsWith('https://') ? [published] : [];
+    return published?.startsWith('https://') ? published : null;
   }
+  return config.publicBaseUrl ? phoneUrl(config.publicBaseUrl) : null;
+}
+
+export function phoneLanUrls(config: EntryConfig): string[] {
   const local = config.localUrls.map(phoneUrl).filter((url): url is string => !!url);
   const rank = (url: string) => {
     const host = new URL(url).hostname;
@@ -45,8 +49,20 @@ export function phoneEntryUrls(config: EntryConfig): string[] {
           : 3;
   };
   local.sort((a, b) => rank(a) - rank(b));
-  const published = config.publicBaseUrl ? phoneUrl(config.publicBaseUrl) : null;
-  return [...new Set([...(published ? [published] : []), ...local])];
+  return [...new Set(local)];
+}
+
+export function phoneEntryUrls(config: EntryConfig, prefer: 'public' | 'lan' = 'public'): string[] {
+  const published = phonePublicUrl(config);
+  if (prefer === 'public' && config.entryMode === 'temporary') return published ? [published] : [];
+  const local = phoneLanUrls(config);
+  return [
+    ...new Set(
+      prefer === 'lan'
+        ? [...local, ...(published ? [published] : [])]
+        : [...(published ? [published] : []), ...local],
+    ),
+  ];
 }
 
 export function isPublicEntry(config: EntryConfig): boolean {

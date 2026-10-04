@@ -34,7 +34,7 @@ export async function readConfig(directory, environment = process.env, mode = 'l
   const env = { ...fromFile, ...environment };
   const temporaryPublic = mode === 'public';
   if (temporaryPublic) {
-    env.HOST = '127.0.0.1';
+    env.HOST = '0.0.0.0';
     env.PUBLIC_BASE_URL = '';
     env.FAMILY_DDZ_ENTRY_MODE = 'temporary';
     env.FAMILY_DDZ_BUILD_MODE = 'public';

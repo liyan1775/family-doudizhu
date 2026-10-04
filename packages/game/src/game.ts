@@ -96,6 +96,14 @@ export function resetRound(game: GameState): void {
   });
   announce(game, '下一局，点准备后开始', ['next-round']);
 }
+/** A player changing tables cancels only the unfinished round, preserving scores. */
+export function cancelRound(game: GameState): void {
+  const { players, round, startingSeat, event } = game;
+  Object.assign(game, createGame(game.mode, game.profile), { players, round, startingSeat, event });
+  players.forEach((p) => {
+    p.ready = false;
+  });
+}
 export function setReady(
   game: GameState,
   id: string,

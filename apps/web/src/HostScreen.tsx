@@ -1,6 +1,12 @@
 import { useEffect, useState } from 'react';
 import QRCode from 'qrcode';
-import { isPublicEntry, phoneEntryUrls, type EntryConfig } from './phone-links.js';
+import {
+  isPublicEntry,
+  phoneEntryUrls,
+  phoneLanUrls,
+  phonePublicUrl,
+  type EntryConfig,
+} from './phone-links.js';
 
 export function HostScreen() {
   const [urls, setUrls] = useState<string[]>([]);
@@ -13,8 +19,11 @@ export function HostScreen() {
   const [config, setConfig] = useState<EntryConfig>({ publicBaseUrl: null, localUrls: [] });
   const [shareMessage, setShareMessage] = useState('');
   const publicMode = isPublicEntry(config);
+  const targetPublic = publicMode && !!target && target === phonePublicUrl(config);
   const entryReady =
-    connected && (config.entryMode !== 'temporary' || config.publicStatus === 'ready');
+    connected &&
+    !!target &&
+    (!targetPublic || config.publicStatus === 'ready' || config.entryMode !== 'temporary');
 
   useEffect(() => {
     let active = true;
@@ -32,7 +41,7 @@ export function HostScreen() {
         if (!response.ok) throw new Error();
         const config: EntryConfig = await response.json();
         if (!Array.isArray(config.localUrls)) throw new Error();
-        const options = phoneEntryUrls(config);
+        const options = phoneEntryUrls(config, 'lan');
         if (!active) return;
         setConfig(config);
         setUrls(options);
@@ -100,9 +109,9 @@ export function HostScreen() {
             : !connected
               ? '主机未连接'
               : publicMode
-                ? entryReady
-                  ? '公网入口已连通'
-                  : '公网入口暂时中断'
+                ? config.publicStatus === 'ready'
+                  ? '同一 Wi-Fi／公网已就绪'
+                  : '同一 Wi-Fi 可玩 · 公网中断'
                 : '电脑主机已连接'}
         </span>
       </header>
@@ -116,12 +125,29 @@ export function HostScreen() {
           </h1>
           <p>
             {publicMode
-              ? '不在一起也能玩。家人用 Wi-Fi 或手机流量，直接扫码加入。'
+              ? '在家扫同一 Wi-Fi 码，连接更快；远方家人扫异地码，也能坐同一桌。'
               : '所有手机和这台电脑连接同一个 Wi-Fi。'}
           </p>
         </section>
         <div className="host-content">
           <section className="host-qr-card" aria-label="手机进入游戏主页">
+            {publicMode && phoneLanUrls(config).length > 0 && (
+              <div className="invite-networks" aria-label="选择扫码网络">
+                <button
+                  className={`button ${!targetPublic ? 'primary' : 'light'}`}
+                  onClick={() => setTarget(phoneLanUrls(config)[0])}
+                >
+                  同一 Wi-Fi · 更快
+                </button>
+                <button
+                  className={`button ${targetPublic ? 'primary' : 'light'}`}
+                  disabled={!phonePublicUrl(config)}
+                  onClick={() => setTarget(phonePublicUrl(config) ?? '')}
+                >
+                  异地／流量
+                </button>
+              </div>
+            )}
             {qr && !error && entryReady ? (
               <img className="host-qr-image" src={qr} alt="游戏主页二维码" />
             ) : (
@@ -136,13 +162,17 @@ export function HostScreen() {
                         : '正在生成二维码…')}
               </div>
             )}
-            <h2>扫一扫，进入游戏主页</h2>
+            <h2>{targetPublic ? '异地／流量扫码，进入同一桌' : '同一 Wi-Fi 扫码，连接更快'}</h2>
             <p>第一位家人和后来的人都可以扫这个码。</p>
             {publicMode && qr && entryReady && !error && (
               <div className="host-share">
                 <a
                   className="button primary"
-                  href={config.entryMode === 'temporary' ? '/api/invite.png' : qr}
+                  href={
+                    config.entryMode === 'temporary'
+                      ? `/api/invite.png?${new URLSearchParams(!targetPublic ? { network: 'lan', address: target } : {})}`
+                      : qr
+                  }
                   download="聚会斗地主-本次邀请.png"
                 >
                   保存二维码
@@ -160,7 +190,12 @@ export function HostScreen() {
                 >
                   复制邀请链接
                 </button>
-                <p role="status">{shareMessage || '保存二维码后，发给远方家人即可。'}</p>
+                <p role="status">
+                  {shareMessage ||
+                    (targetPublic
+                      ? '保存这个码，发给远方家人。'
+                      : '这个码用于同一 Wi-Fi；发给远方家人请先点“异地／流量”。')}
+                </p>
               </div>
             )}
           </section>
@@ -210,7 +245,7 @@ export function HostScreen() {
           <details className="connection-help host-connection-help">
             <summary>扫码打不开？</summary>
             <p>
-              {publicMode ? (
+              {targetPublic ? (
                 '请确认电脑和手机都能上网，并使用本次启动的新二维码。若微信提示打不开，可先在手机浏览器尝试。'
               ) : (
                 <>
