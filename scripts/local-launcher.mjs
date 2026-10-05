@@ -294,6 +294,7 @@ async function prepareBuild(config, log) {
   const required = [
     'node_modules/express/package.json',
     'node_modules/socket.io/package.json',
+    'node_modules/werift/package.json',
     'node_modules/vite/package.json',
     'node_modules/typescript/package.json',
     'node_modules/esbuild/package.json',

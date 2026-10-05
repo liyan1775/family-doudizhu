@@ -101,7 +101,7 @@ test('主页二维码排除电脑专用地址，保留实际端口，不携带�
       publicBaseUrl: 'https://family.example/game/?host=1',
       localUrls: ['http://192.168.1.8:3001'],
     }),
-    ['https://family.example/game', 'http://192.168.1.8:3001'],
+    ['https://family.example/game'],
   );
 });
 

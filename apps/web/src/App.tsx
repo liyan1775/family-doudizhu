@@ -1,5 +1,4 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
-import { type Socket } from 'socket.io-client';
 import QRCode from 'qrcode';
 import {
   analyze,
@@ -23,17 +22,15 @@ import { VoicePlayer, type VoiceStatus } from './voice.js';
 import { MusicPlayer, type MusicStatus } from './music.js';
 import { seatVoice, VOICES } from './audio-catalog.js';
 import { RoomDirectory } from './RoomDirectory.js';
-import {
-  isPublicEntry,
-  phoneEntryUrls,
-  phoneLanUrls,
-  phonePublicUrl,
-  type EntryConfig,
-} from './phone-links.js';
+import { isPublicEntry, phoneEntryUrls, phonePublicUrl, type EntryConfig } from './phone-links.js';
 import { RoomFeedback, isActionTurn } from './room-feedback.js';
 import { TurnCue } from './turn-cue.js';
 import { handLayout } from './hand-layout.js';
-import { createGameConnection } from './connection.js';
+import {
+  createPlayerConnection,
+  type PlayerConnection,
+  type TransportStatus,
+} from './player-connection.js';
 import { entryIntent, entryRequestId, tableSeat } from './entry-session.js';
 
 type Config = EntryConfig;
@@ -198,8 +195,17 @@ function Modal({
 }
 
 export function App() {
-  const [socket, setSocket] = useState<Socket | null>(null);
+  const [connectionCheck] = useState(
+    () => new URLSearchParams(location.search).get('connection-check') === '1',
+  );
+  const [socket, setSocket] = useState<PlayerConnection | null>(null);
   const [connected, setConnected] = useState(false);
+  const [transport, setTransport] = useState<TransportStatus>({
+    route: 'offline',
+    publicConnected: false,
+    directConnected: false,
+    sequence: 0,
+  });
   const [replaced, setReplaced] = useState(false);
   const [room, setRoom] = useState<RoomView | null>(null);
   const [name, setName] = useState(localStorage.getItem('family-name') ?? '');
@@ -288,7 +294,7 @@ export function App() {
       music.setActive(!document.hidden);
     };
     document.addEventListener('visibilitychange', visibility);
-    const s = createGameConnection();
+    const s = createPlayerConnection();
     setSocket(s);
     let connectionGeneration = 0;
     let entryRetry: ReturnType<typeof setTimeout> | undefined;
@@ -340,6 +346,7 @@ export function App() {
       };
       enterSeat();
     });
+    s.on('transport-status', (status: TransportStatus) => setTransport(status));
     s.on('disconnect', () => {
       connectionGeneration++;
       clearTimeout(entryRetry);
@@ -430,7 +437,7 @@ export function App() {
         if (!Array.isArray(data.localUrls)) throw new Error();
         if (!active) return;
         setConfig(data);
-        const urls = phoneEntryUrls(data, 'lan');
+        const urls = phoneEntryUrls(data);
         const base = !localHost && urls.includes(location.origin) ? location.origin : urls[0] || '';
         setInviteBase((current) => (urls.includes(current) ? current : base));
       } catch {
@@ -1363,6 +1370,11 @@ export function App() {
           </div>
         </Modal>
       )}
+      {connectionCheck && (
+        <output className="connection-check" aria-label="连接诊断" data-route={transport.route}>
+          {JSON.stringify(transport)}
+        </output>
+      )}
       {invite && (room || phoneInvite) && (
         <Modal
           title={phoneInvite ? '用手机扫码开桌' : '扫一扫，一起入座'}
@@ -1378,28 +1390,6 @@ export function App() {
               ? 'Wi-Fi 或手机流量都能加入，无需安装软件。'
               : '所有手机和电脑连接同一个 Wi-Fi。'}
           </p>
-          {phoneLanUrls(config).length > 0 && publicMode && (
-            <div className="invite-networks" aria-label="选择邀请方式">
-              <button
-                className={`button ${!publicInvite ? 'primary' : 'light'}`}
-                onClick={() =>
-                  setInviteBase(
-                    phoneLanUrls(config).find((url) => url === location.origin) ??
-                      phoneLanUrls(config)[0],
-                  )
-                }
-              >
-                同一 Wi-Fi · 更快
-              </button>
-              <button
-                className={`button ${publicInvite ? 'primary' : 'light'}`}
-                disabled={!phonePublicUrl(config)}
-                onClick={() => setInviteBase(phonePublicUrl(config) ?? '')}
-              >
-                异地／流量
-              </button>
-            </div>
-          )}
           {qr && qrTarget ? (
             <img
               className="qr-image"
@@ -1422,13 +1412,12 @@ export function App() {
                 config.entryMode === 'temporary'
                   ? `/api/invite.png?${new URLSearchParams({
                       ...(phoneInvite ? {} : { room: room!.roomId }),
-                      ...(!publicInvite ? { network: 'lan', address: inviteBase } : {}),
                     })}`
                   : qr
               }
               download="聚会斗地主-房间邀请.png"
             >
-              {publicInvite ? '保存二维码，发给远方家人' : '保存同一 Wi-Fi 邀请码'}
+              {publicMode ? '保存二维码，分享给家人' : '保存邀请二维码'}
             </a>
           )}
           {!phoneInvite && room && (
@@ -1455,23 +1444,25 @@ export function App() {
                 </>
               )}
             </p>
-            <select
-              aria-label="二维码访问地址"
-              value={inviteBase}
-              onChange={(e) => setInviteBase(e.target.value)}
-            >
-              {phoneEntryUrls(
-                {
-                  ...config,
-                  localUrls: [...config.localUrls, ...(localHost ? [] : [location.origin])],
-                },
-                'lan',
-              ).map((url) => (
-                <option key={url} value={url}>
-                  {url}
-                </option>
-              ))}
-            </select>
+            {!publicMode && (
+              <select
+                aria-label="二维码访问地址"
+                value={inviteBase}
+                onChange={(e) => setInviteBase(e.target.value)}
+              >
+                {phoneEntryUrls(
+                  {
+                    ...config,
+                    localUrls: [...config.localUrls, ...(localHost ? [] : [location.origin])],
+                  },
+                  'lan',
+                ).map((url) => (
+                  <option key={url} value={url}>
+                    {url}
+                  </option>
+                ))}
+              </select>
+            )}
             <p>
               {publicMode
                 ? '本次邀请在启动窗口关闭后结束；电脑重新启动后请分享新二维码。'

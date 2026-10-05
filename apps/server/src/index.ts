@@ -5,7 +5,7 @@ if (!Number.isInteger(port) || port < 1 || port > 65535)
   throw new Error('PORT 必须是1到65535之间的整数');
 const host = process.env.HOST || '0.0.0.0';
 const temporaryPublic = process.env.FAMILY_DDZ_ENTRY_MODE === 'temporary';
-if (temporaryPublic && host !== '0.0.0.0') throw new Error('双入口主机需监听本机和局域网地址');
+if (temporaryPublic && host !== '0.0.0.0') throw new Error('自动直连主机需监听本机和局域网地址');
 const server = makeServer({
   publicBaseUrl: process.env.PUBLIC_BASE_URL,
   temporaryPublic,

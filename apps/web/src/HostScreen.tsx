@@ -1,12 +1,6 @@
 import { useEffect, useState } from 'react';
 import QRCode from 'qrcode';
-import {
-  isPublicEntry,
-  phoneEntryUrls,
-  phoneLanUrls,
-  phonePublicUrl,
-  type EntryConfig,
-} from './phone-links.js';
+import { isPublicEntry, phoneEntryUrls, phonePublicUrl, type EntryConfig } from './phone-links.js';
 
 export function HostScreen() {
   const [urls, setUrls] = useState<string[]>([]);
@@ -41,7 +35,7 @@ export function HostScreen() {
         if (!response.ok) throw new Error();
         const config: EntryConfig = await response.json();
         if (!Array.isArray(config.localUrls)) throw new Error();
-        const options = phoneEntryUrls(config, 'lan');
+        const options = phoneEntryUrls(config);
         if (!active) return;
         setConfig(config);
         setUrls(options);
@@ -110,8 +104,10 @@ export function HostScreen() {
               ? '主机未连接'
               : publicMode
                 ? config.publicStatus === 'ready'
-                  ? '同一 Wi-Fi／公网已就绪'
-                  : '同一 Wi-Fi 可玩 · 公网中断'
+                  ? '邀请已就绪'
+                  : config.publicStatus === 'connecting'
+                    ? '正在准备邀请'
+                    : '邀请入口暂时中断'
                 : '电脑主机已连接'}
         </span>
       </header>
@@ -125,29 +121,12 @@ export function HostScreen() {
           </h1>
           <p>
             {publicMode
-              ? '在家扫同一 Wi-Fi 码，连接更快；远方家人扫异地码，也能坐同一桌。'
+              ? '在家、异地都扫同一个码，入座后自动选择可用连接。'
               : '所有手机和这台电脑连接同一个 Wi-Fi。'}
           </p>
         </section>
         <div className="host-content">
           <section className="host-qr-card" aria-label="手机进入游戏主页">
-            {publicMode && phoneLanUrls(config).length > 0 && (
-              <div className="invite-networks" aria-label="选择扫码网络">
-                <button
-                  className={`button ${!targetPublic ? 'primary' : 'light'}`}
-                  onClick={() => setTarget(phoneLanUrls(config)[0])}
-                >
-                  同一 Wi-Fi · 更快
-                </button>
-                <button
-                  className={`button ${targetPublic ? 'primary' : 'light'}`}
-                  disabled={!phonePublicUrl(config)}
-                  onClick={() => setTarget(phonePublicUrl(config) ?? '')}
-                >
-                  异地／流量
-                </button>
-              </div>
-            )}
             {qr && !error && entryReady ? (
               <img className="host-qr-image" src={qr} alt="游戏主页二维码" />
             ) : (
@@ -156,23 +135,21 @@ export function HostScreen() {
                   (loading
                     ? '正在准备二维码…'
                     : config.entryMode === 'temporary' && !entryReady
-                      ? '公网入口暂时中断，请保持启动窗口打开并检查电脑联网。恢复后二维码会自动显示。'
+                      ? config.publicStatus === 'connecting'
+                        ? '正在连接公网入口，二维码准备好后会自动显示…'
+                        : '公网入口暂时中断，请保持启动窗口打开并检查电脑联网。恢复后二维码会自动显示。'
                       : connected && !target
                         ? '请先让电脑连接家里的 Wi-Fi，再点下面重新检查。'
                         : '正在生成二维码…')}
               </div>
             )}
-            <h2>{targetPublic ? '异地／流量扫码，进入同一桌' : '同一 Wi-Fi 扫码，连接更快'}</h2>
+            <h2>{publicMode ? '一个码，家人都能加入' : '同一 Wi-Fi 扫码加入'}</h2>
             <p>第一位家人和后来的人都可以扫这个码。</p>
             {publicMode && qr && entryReady && !error && (
               <div className="host-share">
                 <a
                   className="button primary"
-                  href={
-                    config.entryMode === 'temporary'
-                      ? `/api/invite.png?${new URLSearchParams(!targetPublic ? { network: 'lan', address: target } : {})}`
-                      : qr
-                  }
+                  href={config.entryMode === 'temporary' ? '/api/invite.png' : qr}
                   download="聚会斗地主-本次邀请.png"
                 >
                   保存二维码
@@ -190,12 +167,7 @@ export function HostScreen() {
                 >
                   复制邀请链接
                 </button>
-                <p role="status">
-                  {shareMessage ||
-                    (targetPublic
-                      ? '保存这个码，发给远方家人。'
-                      : '这个码用于同一 Wi-Fi；发给远方家人请先点“异地／流量”。')}
-                </p>
+                <p role="status">{shareMessage || '保存这个码，分享给家人。'}</p>
               </div>
             )}
           </section>

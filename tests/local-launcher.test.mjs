@@ -50,7 +50,7 @@ async function fixture(t, port, health, mode = 'lan') {
   for (const folder of [`${buildRoot}/client`, `${buildRoot}/server`, 'apps/web/src', 'tmp']) {
     await mkdir(resolve(directory, folder), { recursive: true });
   }
-  for (const name of ['express', 'socket.io', 'vite', 'typescript', 'esbuild']) {
+  for (const name of ['express', 'socket.io', 'werift', 'vite', 'typescript', 'esbuild']) {
     await mkdir(resolve(directory, 'node_modules', name), { recursive: true });
     await writeFile(resolve(directory, 'node_modules', name, 'package.json'), '{}');
   }

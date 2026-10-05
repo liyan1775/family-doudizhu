@@ -84,6 +84,9 @@ export interface GameState {
   event: GameEvent;
 }
 export interface RoomView {
+  /** Transport order, independent of the game's announcement/revision ID. */
+  instanceId?: string;
+  stateVersion?: number;
   roomId: string;
   hostId: string;
   youId: string;

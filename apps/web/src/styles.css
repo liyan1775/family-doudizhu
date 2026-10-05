@@ -1924,3 +1924,16 @@ small {
     gap: 5px 12px;
   }
 }
+.connection-check {
+  position: fixed;
+  z-index: 1000;
+  left: 6px;
+  bottom: 6px;
+  max-width: 92vw;
+  padding: 6px;
+  font: 12px monospace;
+  overflow-wrap: anywhere;
+  background: #fff;
+  color: #163e31;
+  pointer-events: none;
+}

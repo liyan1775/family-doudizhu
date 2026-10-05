@@ -54,7 +54,8 @@ export function phoneLanUrls(config: EntryConfig): string[] {
 
 export function phoneEntryUrls(config: EntryConfig, prefer: 'public' | 'lan' = 'public'): string[] {
   const published = phonePublicUrl(config);
-  if (prefer === 'public' && config.entryMode === 'temporary') return published ? [published] : [];
+  if (prefer === 'public' && (config.entryMode === 'temporary' || isPublicEntry(config)))
+    return published ? [published] : [];
   const local = phoneLanUrls(config);
   return [
     ...new Set(
