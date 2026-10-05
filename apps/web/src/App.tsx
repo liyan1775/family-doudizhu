@@ -26,6 +26,7 @@ import { isPublicEntry, phoneEntryUrls, phonePublicUrl, type EntryConfig } from 
 import { RoomFeedback, isActionTurn } from './room-feedback.js';
 import { TurnCue } from './turn-cue.js';
 import { handLayout } from './hand-layout.js';
+import { useHandSwipe } from './use-hand-swipe.js';
 import {
   createPlayerConnection,
   type PlayerConnection,
@@ -85,12 +86,16 @@ function HandCards({
   cards,
   selected,
   onSelect,
+  onSelectionChange,
+  selectionKey,
   compact,
   scrollRef,
 }: {
   cards: Card[];
   selected: string[];
   onSelect?: (id: string) => void;
+  onSelectionChange?: (ids: string[]) => void;
+  selectionKey: string;
   compact: boolean;
   scrollRef: RefObject<HTMLDivElement | null>;
 }) {
@@ -122,6 +127,12 @@ function HandCards({
     };
   }, [compact, scrollRef]);
   const layout = handLayout(cards.length, size.width, size.height, compact);
+  useHandSwipe(scrollRef, {
+    selected,
+    onChange: onSelectionChange,
+    compact,
+    resetKey: `${selectionKey}:${cards.map((card) => card.id).join(',')}:${size.width}:${size.height}`,
+  });
   const renderCard = (card: Card) => (
     <PlayingCard
       key={card.id}
@@ -133,7 +144,7 @@ function HandCards({
   let offset = 0;
   return (
     <div
-      className="hand-cards"
+      className={`hand-cards ${onSelectionChange ? 'selectable' : ''}`}
       ref={scrollRef}
       style={
         compact
@@ -1195,6 +1206,10 @@ export function App() {
                   selected={selected}
                   compact={landscapeTable}
                   scrollRef={handScroll}
+                  selectionKey={`${room.roomId}:${room.youId}:${room.round}:${room.phase}:${room.turnId}`}
+                  onSelectionChange={
+                    room.phase === 'playing' && myTurn && canAct ? setSelected : undefined
+                  }
                   onSelect={
                     room.phase === 'playing' && myTurn && canAct
                       ? (id) =>
@@ -1211,7 +1226,7 @@ export function App() {
                     ? selected.length
                       ? `${selected.length}张已选 · ${selectedCombo ? describeCombo(selectedCombo) : '请调整为合法牌型'}${selectedCombo && !validSelection ? '，还不能压过' : ''}`
                       : myTurn
-                        ? '点牌选中，再点“出牌”'
+                        ? '点选或滑动选牌，再点“出牌”'
                         : '先看看手牌，轮到您再选'
                     : room.phase === 'finished'
                       ? '剩余手牌'

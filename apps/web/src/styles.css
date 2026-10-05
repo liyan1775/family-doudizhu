@@ -1143,10 +1143,20 @@ small {
   border-radius: 8px;
 }
 .hand-cards {
+  position: relative;
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(57px, 1fr));
   gap: 8px;
   padding-top: 8px;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+.hand-cards.selectable {
+  touch-action: pan-y;
+}
+.hand-cards.selectable .playing-card {
+  touch-action: none;
 }
 .playing-card {
   position: relative;

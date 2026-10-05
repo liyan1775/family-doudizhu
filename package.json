@@ -1,6 +1,6 @@
 {
   "name": "family-doudizhu",
-  "version": "0.6.0",
+  "version": "0.6.2",
   "private": true,
   "type": "module",
   "description": "家人微信扫码参与的聚会斗地主",
